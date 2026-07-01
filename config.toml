@@ -1,0 +1,11 @@
+[dataset]
+root = '/config/workspace/public-hdd/dataset-jaw'
+
+[manufacturer_model]
+CT = [
+    'GE MEDICAL SYSTEMS Discovery CT750 HD',
+    'UIH uCT 960+',
+    'Philips iCT 256',
+    'Imaging Sciences International 17-19DX',
+]
+PX = ['Planmeca ProMax Ethernet Interface', 'Sirona ORTHOPHOS XG']

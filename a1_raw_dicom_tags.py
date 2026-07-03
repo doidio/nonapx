@@ -6,10 +6,14 @@ import shutil
 import warnings
 
 import pydicom
+import pydicom.config
 import tomlkit
 from pydicom.errors import InvalidDicomError
 from tqdm import tqdm
 
+pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
+
+# 缓存格式，变更后需手动删除缓存文件
 specific_tags = (
     'ImageType', 'Modality',
     'PatientID', 'StudyInstanceUID', 'SeriesInstanceUID',
@@ -63,60 +67,66 @@ def launch():
     dataset_root = Path(cfg['dataset']['root'])
     dataset_raw = dataset_root / 'raw'
 
-    # 读取 DICOM 原始信息
-    save_file_tags = dataset_root / 'raw_file_tags'
-    if save_file_tags.exists():
-        file_tags = pickle.loads(save_file_tags.read_bytes())
+    # 解压压缩包
+    files = [_.as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
+    archives = [archive_folder(_) for _ in files]
+    archives = [_ for _ in archives if _[1] is not None]
+
+    succeeded, failed = 0, 0
+    for file, folder in tqdm(archives, 'Unpacking archives'):
+        if folder.exists():
+            shutil.rmtree(folder)
+
+        folder.mkdir()
+
+        try:
+            if file.name.lower().endswith('.zip'):
+                shutil.unpack_archive(file, folder)
+            else:
+                shutil.unpack_archive(file, folder, filter='data')
+            succeeded += 1
+        except Exception as e:
+            failed += 1
+            warnings.warn(f'Unpacking error: {file} {e}', stacklevel=2)
+            shutil.rmtree(folder, ignore_errors=True)
+
+    print(f'Unpacking archives: {succeeded} succeeded {failed} failed')
+
+    # 读取缓存
+    save = dataset_root / 'raw_dicom_tags'
+    if save.exists():
+        dicom_tags = pickle.loads(save.read_bytes())
     else:
-        files = [_.as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
-        archives = [archive_folder(_) for _ in files]
-        archives = [_ for _ in archives if _[1] is not None]
+        dicom_tags = {}
 
-        # 解压压缩包
-        succeeded, failed = 0, 0
-        for file, folder in tqdm(archives, 'Unpacking archives'):
-            if folder.exists():
-                shutil.rmtree(folder)
+    # 增量文件
+    files = [_.as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
+    total = len(files)
 
-            folder.mkdir()
+    files = [_ for _ in files if _ not in dicom_tags]
+    print(f'Found {len(files)} new files in total {total} files')
 
-            try:
-                if file.name.lower().endswith('.zip'):
-                    shutil.unpack_archive(file, folder)
-                else:
-                    shutil.unpack_archive(file, folder, filter='data')
-                succeeded += 1
-            except Exception as e:
-                failed += 1
-                warnings.warn(f'Unpacking error: {file} {e}', stacklevel=2)
-                shutil.rmtree(folder, ignore_errors=True)
+    # 多线程加速机械硬盘读写
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        futures = {executor.submit(dcmread, _): _ for _ in files}
 
-        print(f'Unpacking archives: {succeeded} succeeded {failed} failed')
+        try:
+            for fu in tqdm(as_completed(futures), 'Parsing DICOM', total=len(futures)):
+                try:
+                    res = fu.result()
+                    if res is not None:
+                        dicom_tags[futures[fu]] = res
+                except Exception as _:
+                    warnings.warn(f'{_} {futures[fu]}', stacklevel=2)
 
-        files = [_.as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
-        file_tags = {}
+        except KeyboardInterrupt:
+            print('Keyboard interrupted terminating...')
+            executor.shutdown(wait=False)
+            for future in futures:
+                future.cancel()
+            raise SystemExit
 
-        # 多线程加速机械硬盘读写
-        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-            futures = {executor.submit(dcmread, _): _ for _ in files}
-
-            try:
-                for fu in tqdm(as_completed(futures), 'Parsing DICOM', total=len(futures)):
-                    try:
-                        res = fu.result()
-                        if res is not None:
-                            file_tags[futures[fu]] = res
-                    except Exception as _:
-                        warnings.warn(f'{_} {futures[fu]}', stacklevel=2)
-
-            except KeyboardInterrupt:
-                print('Keyboard interrupted terminating...')
-                executor.shutdown(wait=False)
-                for future in futures:
-                    future.cancel()
-                raise SystemExit
-
-        save_file_tags.write_bytes(pickle.dumps(file_tags))
+    save.write_bytes(pickle.dumps(dicom_tags))
 
     # 统计摘要
     summary = []
@@ -127,7 +137,7 @@ def launch():
             uid_k = uid_key.removesuffix('InstanceUID')
 
             tree = {}
-            for file, tags in tqdm(file_tags.items(), f'{modality} {uid_k}'):
+            for file, tags in tqdm(dicom_tags.items(), f'{modality} {uid_k}'):
                 tags = dict(zip(specific_tags, tags))
 
                 if modality != tags['Modality']:
@@ -163,7 +173,7 @@ def launch():
 
     # 指定设备型号的患者/模态分类统计
     tree, patients = {}, set()
-    for file, tags in tqdm(file_tags.items(), 'Patients'):
+    for file, tags in tqdm(dicom_tags.items(), 'Patients'):
         tags = dict(zip(specific_tags, tags))
 
         patient_id = tags['PatientID']
@@ -208,8 +218,8 @@ def launch():
     ]))
 
     # 统计摘要
-    save_file_tags = Path(__file__).resolve().parent / 'SUMMARY.md'
-    save_file_tags.write_text('\n\n'.join(summary), encoding='utf-8')
+    save = Path(__file__).resolve().parent / 'SUMMARY.md'
+    save.write_text('\n\n'.join(summary), encoding='utf-8')
 
 
 if __name__ == '__main__':

@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["pydicom>=3.0.2", "tomlkit>=0.15.0", "tqdm>=4.68.3"]
+dependencies = [
+    "itk>=5.4.6",
+    "pydicom>=3.0.2",
+    "tomlkit>=0.15.0",
+    "tqdm>=4.68.3",
+]
 
 [tool.ruff]
 line-length = 150

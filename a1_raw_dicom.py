@@ -11,17 +11,9 @@ import tomlkit
 from pydicom.errors import InvalidDicomError
 from tqdm import tqdm
 
+from a0_define import specific_tags, specific_modalities
+
 pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
-
-# 缓存格式，变更后需手动删除缓存文件
-specific_tags = (
-    'ImageType', 'Modality',
-    'PatientID', 'StudyInstanceUID', 'SeriesInstanceUID',
-    'StudyDate', 'StudyTime',
-    'Manufacturer', 'ManufacturerModelName',
-)
-
-specific_modalities = ('CT', 'PX')
 
 
 def archive_folder(file: str | Path):
@@ -64,7 +56,7 @@ def launch():
 
     cfg = tomlkit.loads(Path(args.config).read_text('utf-8')).unwrap()
 
-    dataset_root = Path(cfg['dataset']['root'])
+    dataset_root = Path(cfg['dataset']['root']).resolve().absolute()
     dataset_raw = dataset_root / 'raw'
 
     # 解压压缩包
@@ -93,40 +85,41 @@ def launch():
     print(f'Unpacking archives: {succeeded} succeeded {failed} failed')
 
     # 读取缓存
-    save = dataset_root / 'raw_dicom_tags'
-    if save.exists():
-        dicom_tags = pickle.loads(save.read_bytes())
+    save_raw_dicom_meta = dataset_root / 'raw_dicom_meta'
+    if save_raw_dicom_meta.exists():
+        print(f'Loading cache from {save_raw_dicom_meta}')
+        dicom_tags = pickle.loads(save_raw_dicom_meta.read_bytes())
     else:
         dicom_tags = {}
 
     # 增量文件
-    files = [_.as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
-    total = len(files)
+    files = [_.relative_to(dataset_raw).as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
 
-    files = [_ for _ in files if _ not in dicom_tags]
-    print(f'Found {len(files)} new files in total {total} files')
+    new_files = [_ for _ in files if _ not in dicom_tags]
+    print(f'Found {len(new_files)} new files in total {len(files)} files')
 
     # 多线程加速机械硬盘读写
-    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        futures = {executor.submit(dcmread, _): _ for _ in files}
+    if len(new_files):
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            futures = {executor.submit(dcmread, dataset_raw / _): _ for _ in new_files}
 
-        try:
-            for fu in tqdm(as_completed(futures), 'Parsing DICOM', total=len(futures)):
-                try:
-                    res = fu.result()
-                    if res is not None:
+            try:
+                for fu in tqdm(as_completed(futures), 'Parsing DICOM', len(futures)):
+                    try:
+                        res = fu.result()
                         dicom_tags[futures[fu]] = res
-                except Exception as _:
-                    warnings.warn(f'{_} {futures[fu]}', stacklevel=2)
+                    except Exception as e:
+                        warnings.warn(f'{e} {futures[fu]}', stacklevel=2)
+                        dicom_tags[futures[fu]] = None
 
-        except KeyboardInterrupt:
-            print('Keyboard interrupted terminating...')
-            executor.shutdown(wait=False)
-            for future in futures:
-                future.cancel()
-            raise SystemExit
+            except KeyboardInterrupt:
+                print('Keyboard interrupted terminating...')
+                executor.shutdown(wait=False)
+                for future in futures:
+                    future.cancel()
+                raise SystemExit
 
-    save.write_bytes(pickle.dumps(dicom_tags))
+        save_raw_dicom_meta.write_bytes(pickle.dumps(dicom_tags))
 
     # 统计摘要
     summary = []
@@ -138,6 +131,9 @@ def launch():
 
             tree = {}
             for file, tags in tqdm(dicom_tags.items(), f'{modality} {uid_k}'):
+                if tags is None:
+                    continue
+
                 tags = dict(zip(specific_tags, tags))
 
                 if modality != tags['Modality']:
@@ -147,18 +143,10 @@ def launch():
                 mfm = ' '.join([tags['Manufacturer'], tags['ManufacturerModelName']])
 
                 if mfm not in tree:
-                    tree[mfm] = {}
+                    tree[mfm] = set()
 
                 if uid not in tree[mfm]:
-                    tree[mfm][uid] = {
-                        'patient_id': tags['PatientID'],
-                        'study_uid': tags['StudyInstanceUID'],
-                        'study_date': tags['StudyDate'],
-                        'study_time': tags['StudyTime'],
-                        'files': [],
-                    }
-
-                tree[mfm][uid]['files'].append(Path(file).relative_to(dataset_raw).as_posix())
+                    tree[mfm].add(uid)
 
             nums = [(mfm, len(tree[mfm])) for mfm in tree]
             nums = sorted(nums, key=lambda x: x[1], reverse=True)
@@ -174,6 +162,9 @@ def launch():
     # 指定设备型号的患者/模态分类统计
     tree, patients = {}, set()
     for file, tags in tqdm(dicom_tags.items(), 'Patients'):
+        if tags is None:
+            continue
+
         tags = dict(zip(specific_tags, tags))
 
         patient_id = tags['PatientID']
@@ -187,24 +178,20 @@ def launch():
             continue
 
         if patient_id not in tree:
-            tree[patient_id] = {_: {} for _ in specific_modalities}
+            tree[patient_id] = {}
+
+        if modality not in tree[patient_id]:
+            tree[patient_id][modality] = set()
 
         if uid not in tree[patient_id][modality]:
-            tree[patient_id][modality][uid] = {
-                'study_uid': tags['StudyInstanceUID'],
-                'study_date': tags['StudyDate'],
-                'study_time': tags['StudyTime'],
-                'files': [],
-            }
-
-        tree[patient_id][modality][uid]['files'].append(Path(file).relative_to(dataset_raw).as_posix())
+            tree[patient_id][modality].add(uid)
 
     single = {_: 0 for _ in specific_modalities}
     multiple = 0
     for patient_id in tree:
         is_single = False
         for modality in specific_modalities:
-            if len(tree[patient_id][modality]) == sum(len(series) for series in tree[patient_id].values()):
+            if modality in tree[patient_id] and len(tree[patient_id].keys()) == 1:
                 single[modality] += 1
                 is_single = True
         if not is_single:
@@ -218,8 +205,8 @@ def launch():
     ]))
 
     # 统计摘要
-    save = Path(__file__).resolve().parent / 'SUMMARY.md'
-    save.write_text('\n\n'.join(summary), encoding='utf-8')
+    f = Path(__file__).resolve().parent / 'SUMMARY.md'
+    f.write_text('\n\n'.join(summary), encoding='utf-8')
 
 
 if __name__ == '__main__':

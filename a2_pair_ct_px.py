@@ -10,7 +10,7 @@ import tempfile
 import tomlkit
 from tqdm import tqdm
 
-from a0_define import specific_tags, specific_modalities
+from a0_define import major_tags, minor_tags, pair_modalities
 
 
 def main(files: list[Path], series_dir: Path):
@@ -21,15 +21,44 @@ def main(files: list[Path], series_dir: Path):
     series_dir.mkdir(parents=True, exist_ok=True)
     modality = series_dir.parent.name
 
-    if modality == 'PX' and len(files) == 1:
-        image = itk.imread(files[0].as_posix(), itk.SS)
-        itk.imwrite(image, series_dir / 'image.nii.gz')
-    else:
+    if len(files) == 0:
+        return {'modality': modality, 'files': len(files)}
+    elif modality == 'PX':
+        if len(files) > 1:
+            return {'modality': modality, 'files': len(files)}
+        else:
+            image = itk.imread(files[0].as_posix(), itk.SS)
+            size = [int(_) for _ in itk.size(image)]
+
+            if len(size) == 2:
+                import numpy as np
+                array = itk.array_from_image(image)
+                array_3d = np.expand_dims(array, axis=0)
+                image_3d = itk.image_from_array(array_3d)
+
+                spacing = itk.spacing(image)
+                image_3d.SetSpacing([spacing[0], spacing[1], 1.0])
+
+                origin = itk.origin(image)
+                image_3d.SetOrigin([origin[0], origin[1], 0.0])
+
+                image = image_3d
+                size = [int(_) for _ in itk.size(image)]
+
+            if len(size) == 3:
+                itk.imwrite(image, series_dir / 'image.nii.gz')
+            else:
+                return {'modality': modality, 'size': size}
+    elif modality == 'CT':
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
-            for f in files:
-                shutil.copy(f, tmpdir / f.name)
+            for i, f in enumerate(files):
+                filename = f'{i}_{f.name}'
+                try:
+                    (tmpdir / filename).symlink_to(f)
+                except Exception:
+                    shutil.copy(f, tmpdir / filename)
 
             names_generator = itk.GDCMSeriesFileNames.New()
             names_generator.SetDirectory(tmpdir.as_posix())
@@ -46,15 +75,20 @@ def main(files: list[Path], series_dir: Path):
             reader.Update()
 
         image = reader.GetOutput()
-        itk.imwrite(image, series_dir / 'image.nii.gz')
 
         meta_dict = dict(image)
 
         # 非均匀采样，检查是否有文件缺失
         if 'ITK_non_uniform_sampling_deviation' in meta_dict:
-            deviation = meta_dict['ITK_non_uniform_sampling_deviation']
+            deviation = float(meta_dict['ITK_non_uniform_sampling_deviation'])
             slice_thickness = float(itk.spacing(image)[2])
+            if deviation / slice_thickness < 0.1:
+                itk.imwrite(image, series_dir / 'image.nii.gz')
             return {'non_uniform_sampling_deviation': deviation, 'slice_thickness': slice_thickness}
+        else:
+            itk.imwrite(image, series_dir / 'image.nii.gz')
+    else:
+        return {'modality': modality, 'files': len(files)}
 
 
 def launch():
@@ -80,7 +114,7 @@ def launch():
         if meta is None:
             continue
 
-        meta = dict(zip(specific_tags, meta))
+        meta = dict(zip(major_tags + minor_tags, meta))
 
         patient_id = meta['PatientID']
         series_uid = meta['SeriesInstanceUID']
@@ -99,23 +133,17 @@ def launch():
             tree[patient_id][modality] = {}
 
         if series_uid not in tree[patient_id][modality]:
-            tree[patient_id][modality][series_uid] = {
-                'series_uid': series_uid,
-                'study_uid': meta['StudyInstanceUID'],
-                'study_date': meta['StudyDate'],
-                'study_time': meta['StudyTime'],
-                'files': [],
-            }
+            tree[patient_id][modality][series_uid] = {**meta, 'files': []}
 
         tree[patient_id][modality][series_uid]['files'].append(file)
 
     # 筛选全模态数据
-    full_modality_patients = set()
+    pair_modality_patients = set()
     for patient_id in tree:
-        if False not in [_ in tree[patient_id] for _ in specific_modalities]:
-            full_modality_patients.add(patient_id)
+        if False not in [_ in tree[patient_id] for _ in pair_modalities]:
+            pair_modality_patients.add(patient_id)
 
-    print(f'Full-modality patients: {len(full_modality_patients)}')
+    print(f'Pair modality patients: {len(pair_modality_patients)}')
 
     # 读取缓存
     save_series_errors = dataset_root / 'series_errors'
@@ -127,7 +155,7 @@ def launch():
 
     # 增量文件
     threads, total = [], 0
-    for patient_id in full_modality_patients:
+    for patient_id in pair_modality_patients:
         for modality in tree[patient_id]:
             for series_uid in tree[patient_id][modality]:
                 total += 1
@@ -165,14 +193,14 @@ def launch():
         save_series_errors.write_bytes(pickle.dumps(series_errors))
 
     # 保存元信息
-    paired_tree = {_: deepcopy(tree[_]) for _ in full_modality_patients}
-    for patient_id in paired_tree:
-        for modality in paired_tree[patient_id]:
-            for series_uid in paired_tree[patient_id][modality]:
-                del paired_tree[patient_id][modality][series_uid]['files']
+    pair_tree = {_: deepcopy(tree[_]) for _ in pair_modality_patients}
+    for patient_id in pair_tree:
+        for modality in pair_tree[patient_id]:
+            for series_uid in pair_tree[patient_id][modality]:
+                del pair_tree[patient_id][modality][series_uid]['files']
 
     f = dataset_root / 'pair_meta'
-    f.write_bytes(pickle.dumps(paired_tree))
+    f.write_bytes(pickle.dumps(pair_tree))
 
 
 if __name__ == '__main__':

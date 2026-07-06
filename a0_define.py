@@ -1,10 +1,17 @@
-
 # 缓存格式，变更后需手动删除缓存文件
-specific_tags = (
+major_tags = (
     'ImageType', 'Modality',
     'PatientID', 'StudyInstanceUID', 'SeriesInstanceUID',
-    'StudyDate', 'StudyTime',
     'Manufacturer', 'ManufacturerModelName',
 )
 
-specific_modalities = ('CT', 'PX')
+minor_tags = (
+    'StudyDate', 'StudyTime',
+    'PatientName', 'PatientSex', 'PatientAge',
+    'NumberOfFrames',
+    'StudyDescription', 'SeriesDescription',
+    'WindowCenter', 'WindowWidth',
+    'ImageOrientationPatient',
+)
+
+pair_modalities = ('CT', 'PX')

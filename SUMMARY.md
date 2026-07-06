@@ -56,5 +56,5 @@ pie title 146 PX Series on manufacturer model
 pie title 933 Patients on modality
     "CT only: 794": 794
     "PX only: 37": 37
-    "Multi-modality: 102": 102
+    "Pair: 102": 102
 ```

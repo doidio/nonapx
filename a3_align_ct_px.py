@@ -42,22 +42,28 @@ if (it := st.session_state.get('init')) is None:
 elif (it := st.session_state.get('select')) is None:
     cfg, pair_meta = st.session_state['init']
 
+    st.metric('Valid pairs', len(pair_meta))
+
     def fn_patient(_):
-        return f'{_} CT {len(pair_meta[_]['CT'])} PX {len(pair_meta[_]['PX'])}'
+        return f'{_} CT {len(pair_meta[_]['CT'])} PANORAMA {len(pair_meta[_]['PANORAMA'])}'
 
     patient_id = st.selectbox('Patient ID', list(sorted(pair_meta.keys())), format_func=fn_patient)
 
     def fn_series(mo, _):
-        return ' '.join([
-            pair_meta[patient_id][mo][_]['Manufacturer'],
-            pair_meta[patient_id][mo][_]['ManufacturerModelName'],
+        meta = pair_meta[patient_id][mo][_]
+        text = [
+            modality := meta['Modality'],
             _,
-        ])
+        ]
+
+        mfm = ' '.join([_ for _ in (meta['Manufacturer'], meta['ManufacturerModelName']) if _ is not None and _ != ''])
+        text.append(f'[{mfm}]')
+
+        if modality == 'CT':
+            text.append(str(meta['spacing']))
+            text.append(str(meta['size']))
+        return ' '.join(text)
 
     ct_series_id = st.radio('CT Series UID', list(sorted(pair_meta[patient_id]['CT'])), format_func=partial(fn_series, 'CT'))
 
-    st.code(json.dumps(pair_meta[patient_id]['CT'][ct_series_id]), 'toml')
-
-    px_series_id = st.radio('PX Series UID', list(sorted(pair_meta[patient_id]['PX'])), format_func=partial(fn_series, 'PX'))
-
-    st.code(json.dumps(pair_meta[patient_id]['PX'][px_series_id]), 'toml')
+    pa_series_id = st.radio('PANORAMA Series UID', list(sorted(pair_meta[patient_id]['PANORAMA'])), format_func=partial(fn_series, 'PANORAMA'))

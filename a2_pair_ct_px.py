@@ -16,7 +16,7 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
     patient_id = it['patient_id']
     category = it['category']
     series_uid = it['series_uid']
-    files = [dataset_raw / _ for _ in it['files']]
+    files = [dataset_raw / _ for _ in it['files'].values()]
 
     import itk
     itk.ProcessObject.SetGlobalWarningDisplay(False)
@@ -26,10 +26,11 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
     series_dir.mkdir(parents=True, exist_ok=True)
 
     if len(files) == 0:
-        return {**it, 'error': {'files': len(files)}}
-    elif category == 'PANORAMA':
+        return {**it, 'error': {'category': category, 'files': len(files)}}
+
+    if category == 'PANORAMA':
         if len(files) > 1:
-            return {**it, 'error': {'files': len(files)}}
+            return {**it, 'error': {'category': category, 'files': len(files)}}
         else:
             image = itk.imread(files[0].as_posix(), itk.SS)
 
@@ -55,7 +56,7 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
                 size = [int(_) for _ in itk.size(image)]
                 return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size}}
             else:
-                return {**it, 'error': {'dimension': len(itk.size(image))}}
+                return {**it, 'error': {'category': category, 'dimension': len(itk.size(image))}}
     elif category == 'CT':
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
@@ -72,7 +73,7 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
             series_uids = names_generator.GetSeriesUIDs()
 
             if len(series_uids) != 1:
-                return {**it, 'error': {'series_uids': series_uids}}
+                return {**it, 'error': {'category': category, 'series_uids': series_uids}}
 
             file_names = names_generator.GetFileNames(series_uids[0])
 
@@ -86,22 +87,25 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
         spacing = [float(_) for _ in itk.spacing(image)]
         size = [int(_) for _ in itk.size(image)]
 
-        meta_dict = image.GetMetaDataDictionary()
+        if True in [_ > 1.5 for _ in spacing]:
+            return {**it, 'error': {'category': category, 'spacing': spacing}}
 
         # 非均匀采样，检查是否有文件缺失
+        meta_dict = image.GetMetaDataDictionary()
         if meta_dict.HasKey('ITK_non_uniform_sampling_deviation'):
-            deviation = float(meta_dict['ITK_non_uniform_sampling_deviation'])
-            slice_thickness = float(itk.spacing(image)[2])
-            if slice_thickness > 1e-6 and deviation / slice_thickness < 0.1:
+            d = float(meta_dict['ITK_non_uniform_sampling_deviation'])
+            z = float(itk.spacing(image)[2])
+
+            if z > 1e-6 and d / z < 0.1:
                 itk.imwrite(image, series_dir / 'image.nii.gz')
                 return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size}}
             else:
-                return {**it, 'error': {'non_uniform_sampling_deviation': deviation, 'slice_thickness': slice_thickness}}
+                return {**it, 'error': {'category': category, 'non_uniform_sampling_deviation': d, 'slice_thickness': z}}
         else:
             itk.imwrite(image, series_dir / 'image.nii.gz')
             return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size}}
     else:
-        return {**it, 'error': {'files': len(files)}}
+        return {**it, 'error': {'category': category}}
 
 
 def launch():
@@ -132,6 +136,13 @@ def launch():
 
         patient_id = meta['PatientID']
         series_uid = meta['SeriesInstanceUID']
+        sop_uid = meta['SOPInstanceUID']
+        image_type = meta['ImageType']
+        modality = meta['Modality']
+
+        if modality != 'SC':
+            if 'ORIGINAL' not in image_type or 'PRIMARY' not in image_type or 'LOCALIZER' in image_type:
+                continue
 
         if patient_id not in series_metas:
             series_metas[patient_id] = {}
@@ -140,9 +151,9 @@ def launch():
             series_metas[patient_id][series_uid] = meta
 
         if series_uid not in series_files:
-            series_files[series_uid] = set()
+            series_files[series_uid] = {}
 
-        series_files[series_uid].add(file)
+        series_files[series_uid][sop_uid] = file
 
     # 筛选有效的配对数据
     pair_meta = {}
@@ -151,12 +162,11 @@ def launch():
         ct_series = {_: series_metas[patient_id][_] for _ in series_metas[patient_id] if series_metas[patient_id][_]['Modality'] == 'CT'}
 
         # CT 只允许原始图像
-        ct_series = {_: ct_series[_] for _ in ct_series
-                     if 'ORIGINAL' in ct_series[_]['ImageType'] and 'PRIMARY' in ct_series[_]['ImageType'] and 'LOCALIZER' not in ct_series[_]['ImageType']}
+        ct_series = {_: ct_series[_] for _ in ct_series}
 
         # PX 只允许原始图像
         px_series = {_: series_metas[patient_id][_] for _ in series_metas[patient_id] if series_metas[patient_id][_]['Modality'] == 'PX'}
-        px_series = {_: px_series[_] for _ in px_series if 'ORIGINAL' in px_series[_]['ImageType'] and 'PRIMARY' in px_series[_]['ImageType']}
+        px_series = {_: px_series[_] for _ in px_series}
 
         # SC 只允许二次后处理的全景片图像
         sc_series = {_: series_metas[patient_id][_] for _ in series_metas[patient_id] if series_metas[patient_id][_]['Modality'] == 'SC'}
@@ -194,7 +204,7 @@ def launch():
             for series_uid in pair_meta[patient_id][category]:
                 it = pair_series.get(series_uid, {})
 
-                if it.get('files', set()) == series_files[series_uid]:
+                if set(it.get('files', {}).keys()) == set(series_files[series_uid].keys()):
                     if 'meta' in it:
                         pair_meta[patient_id][category][series_uid].update(it['meta'])
                     continue
@@ -203,7 +213,7 @@ def launch():
                     'patient_id': patient_id,
                     'category': category,
                     'series_uid': series_uid,
-                    'files': set([_ for _ in series_files[series_uid]]),
+                    'files': series_files[series_uid],
                 }
 
     print(f'Found {len(new_series)} new series')
@@ -227,7 +237,7 @@ def launch():
 
                     except Exception as e:
                         it = futures[fu]
-                        it = {**it, 'error': {'exception': str(e)}}
+                        it = {**it, 'error': {'category': category, 'exception': str(e)}}
 
                         patient_id = it['patient_id']
                         category = it['category']
@@ -268,7 +278,7 @@ def launch():
         for category in rm_modalities:
             del pair_meta[patient_id][category]
 
-        if len(pair_meta[patient_id]) == 0:
+        if set(pair_meta[patient_id]) != {'CT', 'PANORAMA'}:
             rm_patients.append(patient_id)
 
     for patient_id in rm_patients:
@@ -281,10 +291,30 @@ def launch():
     # 统计摘要
     summary = []
     summary.append('\n'.join([
-        '```mermaid', f'pie title {len(pair_meta)} pairs with readable series from',
-        f'    "Both CT/PANORAMA: {both_ct_panorama}" : {both_ct_panorama}',
-        f'    "CT only: {only_ct}" : {only_ct}',
-        f'    "PANORAMA only: {only_panorama}" : {only_panorama}',
+        '```mermaid', f'pie title Patients on category',
+        f'    "Pair CT/PANORAMA: {both_ct_panorama}" : {both_ct_panorama}',
+        f'    "Only CT: {only_ct}" : {only_ct}',
+        f'    "Only PANORAMA: {only_panorama}" : {only_panorama}',
+        '```',
+    ]))
+
+    num = {}
+    for patient_id in pair_meta:
+        for category in ('CT', 'PANORAMA'):
+            for series_uid in pair_meta[patient_id][category]:
+                meta = pair_meta[patient_id][category][series_uid]
+                modality = meta['Modality']
+
+                if modality not in num:
+                    num[modality] = 0
+
+                num[modality] += 1
+
+    summary.append(f'{len(pair_meta)} valid pairs on CT-PANORAMA')
+
+    summary.append('\n'.join([
+        '```mermaid', f'pie title Series on modalities',
+        *(f'    "{k}: {v}" : {v}' for k, v in num.items()),
         '```',
     ]))
     f = Path(__file__).parent / (Path(__file__).name.removesuffix('.py') + '.md')

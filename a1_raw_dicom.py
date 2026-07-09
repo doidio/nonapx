@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 required_tags = (
     'ImageType', 'Modality',
-    'PatientID', 'StudyInstanceUID', 'SeriesInstanceUID',
+    'PatientID', 'StudyInstanceUID', 'SeriesInstanceUID', 'SOPInstanceUID',
 )
 
 meta_tags = required_tags + (
@@ -117,8 +117,7 @@ def launch():
             try:
                 for fu in tqdm(as_completed(futures), 'Parsing DICOM', len(futures)):
                     try:
-                        res = fu.result()
-                        raw_meta[futures[fu]] = res
+                        raw_meta[futures[fu]] = fu.result()
                     except Exception as e:
                         warnings.warn(f'{e} {futures[fu]}', stacklevel=2)
                         raw_meta[futures[fu]] = None

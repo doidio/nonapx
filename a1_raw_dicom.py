@@ -5,15 +5,25 @@ from pathlib import Path
 import shutil
 import warnings
 
-import pydicom
-import pydicom.config
 import tomlkit
 from pydicom.errors import InvalidDicomError
 from tqdm import tqdm
 
-from a0_define import major_tags, minor_tags, pair_modalities
+required_tags = (
+    'ImageType', 'Modality',
+    'PatientID', 'StudyInstanceUID', 'SeriesInstanceUID',
+)
 
-pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
+meta_tags = required_tags + (
+    'StudyDate', 'StudyTime',
+    'PatientName', 'PatientSex', 'PatientAge',
+    'Manufacturer', 'ManufacturerModelName',
+    'NumberOfFrames',
+    'StudyDescription', 'SeriesDescription',
+    'WindowCenter', 'WindowWidth',
+    'ImageOrientationPatient',
+    'ImageComments',
+)
 
 
 def archive_folder(file: str | Path):
@@ -29,22 +39,20 @@ def archive_folder(file: str | Path):
 
 
 def dcmread(file: str | Path):
+    import pydicom
+    import pydicom.config
+
+    pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
+
     try:
-        ds = pydicom.dcmread(file, stop_before_pixels=True, specific_tags=list(major_tags + minor_tags))
+        ds = pydicom.dcmread(file, stop_before_pixels=True, specific_tags=list(meta_tags))
     except InvalidDicomError:
         return
 
-    meta = [ds.get(_) for _ in major_tags]
+    meta = [ds.get(_) for _ in meta_tags]
+    meta = [_ if _ != '' else None for _ in meta]
 
-    if None in meta:
-        return
-
-    meta += [ds.get(_) for _ in minor_tags]
-
-    if not ('ORIGINAL' in str(ds.ImageType) and 'PRIMARY' in str(ds.ImageType)):
-        return
-
-    if str(ds.Modality) not in pair_modalities:
+    if None in meta[:len(required_tags)]:
         return
 
     return [str(_) if _ is not None else None for _ in meta]
@@ -62,43 +70,44 @@ def launch():
     dataset_raw = dataset_root / 'raw'
 
     # 解压压缩包
-    files = [_.as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
-    archives = [archive_folder(_) for _ in files]
-    archives = [_ for _ in archives if _[1] is not None]
+    archives = [archive_folder(_) for _ in tqdm(dataset_raw.rglob('*'), 'Scan archives') if _.is_file()]
+    archives = [_ for _ in tqdm(archives, 'Scan archives') if _[1] is not None]
+    print(f'Found {len(archives)} archives')
 
-    succeeded, failed = 0, 0
-    for file, folder in tqdm(archives, 'Unpacking archives'):
-        if folder.exists():
-            shutil.rmtree(folder)
+    if len(archives):
+        succeeded, failed = 0, 0
+        for file, folder in tqdm(archives, 'Unpacking archives'):
+            if folder.exists():
+                shutil.rmtree(folder)
 
-        folder.mkdir()
+            folder.mkdir()
 
-        try:
-            if file.name.lower().endswith('.zip'):
-                shutil.unpack_archive(file, folder)
-            else:
-                shutil.unpack_archive(file, folder, filter='data')
-            succeeded += 1
-        except Exception as e:
-            failed += 1
-            warnings.warn(f'Unpacking error: {file} {e}', stacklevel=2)
-            shutil.rmtree(folder, ignore_errors=True)
+            try:
+                if file.name.lower().endswith('.zip'):
+                    shutil.unpack_archive(file, folder)
+                else:
+                    shutil.unpack_archive(file, folder, filter='data')
+                succeeded += 1
+                file.unlink()
+            except Exception as e:
+                failed += 1
+                warnings.warn(f'Unpacking error: {file} {e}', stacklevel=2)
+                shutil.rmtree(folder, ignore_errors=True)
 
-    print(f'Unpacking archives: {succeeded} succeeded {failed} failed')
+        print(f'Unpacking archives: {succeeded} succeeded {failed} failed')
 
     # 读取缓存
-    save_raw_dicom_meta = dataset_root / 'raw_dicom_meta'
-    if save_raw_dicom_meta.exists():
-        print(f'Loading cache from {save_raw_dicom_meta}')
-        dicom_meta = pickle.loads(save_raw_dicom_meta.read_bytes())
+    save_raw_meta = dataset_root / 'raw_meta'
+    if save_raw_meta.exists():
+        print(f'Loading cache from {save_raw_meta}')
+        raw_meta = pickle.loads(save_raw_meta.read_bytes())
     else:
-        dicom_meta = {}
+        raw_meta = {}
 
     # 增量文件
-    files = [_.relative_to(dataset_raw).as_posix() for _ in dataset_raw.rglob('*') if _.is_file()]
-
-    new_files = [_ for _ in files if _ not in dicom_meta]
-    print(f'Found {len(new_files)} new files in total {len(files)} files')
+    new_files = [_.relative_to(dataset_raw).as_posix() for _ in tqdm(dataset_raw.rglob('*'), 'Scan new files')
+                 if _.is_file() and _.relative_to(dataset_raw).as_posix() not in raw_meta]
+    print(f'Found {len(new_files)} new files')
 
     # 多线程加速机械硬盘读写
     if len(new_files):
@@ -109,10 +118,10 @@ def launch():
                 for fu in tqdm(as_completed(futures), 'Parsing DICOM', len(futures)):
                     try:
                         res = fu.result()
-                        dicom_meta[futures[fu]] = res
+                        raw_meta[futures[fu]] = res
                     except Exception as e:
                         warnings.warn(f'{e} {futures[fu]}', stacklevel=2)
-                        dicom_meta[futures[fu]] = None
+                        raw_meta[futures[fu]] = None
 
             except KeyboardInterrupt:
                 print('Keyboard interrupted terminating...')
@@ -121,31 +130,40 @@ def launch():
                     future.cancel()
                 raise SystemExit
 
-        save_raw_dicom_meta.write_bytes(pickle.dumps(dicom_meta))
+        save_raw_meta.write_bytes(pickle.dumps(raw_meta))
 
-    # 统计摘要
+    # 统计模态
+    modalities = set()
+    for file, meta in tqdm(raw_meta.items(), f'Scan modalities'):
+        if meta is None:
+            continue
+        meta = dict(zip(meta_tags, meta))
+        if meta['Modality'] is not None:
+            modalities.add(meta['Modality'])
+    print(f'Found {len(modalities)} modalities')
+
+    # 统计每种模态的设备品牌型号
     summary = []
-
-    # 模态/设备型号分类统计
-    for modality in pair_modalities:
-        for uid_key in ('StudyInstanceUID', 'SeriesInstanceUID'):
-            uid_k = uid_key.removesuffix('InstanceUID')
+    for modality in modalities:
+        for i, uid_key in enumerate(('PatientID', 'StudyInstanceUID', 'SeriesInstanceUID')):
+            name = ['Patient', 'Study', 'Series'][i]
 
             tree = {}
-            for file, meta in tqdm(dicom_meta.items(), f'{modality} {uid_k}'):
+            for file, meta in tqdm(raw_meta.items(), f'{modality} {name}'):
                 if meta is None:
                     continue
 
-                meta = dict(zip(major_tags + minor_tags, meta))
+                meta = dict(zip(meta_tags, meta))
 
                 if modality != meta['Modality']:
                     continue
 
-                uid = meta[uid_key]
-                mfm = ' '.join([meta['Manufacturer'], meta['ManufacturerModelName']])
+                mfm = ' '.join([_ for _ in (meta['Manufacturer'], meta['ManufacturerModelName']) if _ is not None and _ != ''])
 
                 if mfm not in tree:
                     tree[mfm] = set()
+
+                uid = meta[uid_key]
 
                 if uid not in tree[mfm]:
                     tree[mfm].add(uid)
@@ -154,60 +172,13 @@ def launch():
             nums = sorted(nums, key=lambda x: x[1], reverse=True)
 
             summary.append('\n'.join([
-                '```mermaid', f'pie title {sum(num for _, num in nums)} {modality} {uid_k} on manufacturer model',
-                *[f'    "{('*' + mfm) if mfm in cfg['manufacturer_model'][modality] else mfm}: {num}" : {num}' for mfm, num in nums],
+                '```mermaid', f'pie title {sum(num for _, num in nums)} {modality} {name} on manufacturer model',
+                *[f'    "{mfm}: {num}" : {num}' for mfm, num in nums],
                 '```',
             ]))
 
-            summary.append('\n > \\*: specified manufacturer model')
-
-    # 指定设备型号的患者/模态分类统计
-    tree, patients = {}, set()
-    for file, meta in tqdm(dicom_meta.items(), 'Patients'):
-        if meta is None:
-            continue
-
-        meta = dict(zip(major_tags + minor_tags, meta))
-
-        patient_id = meta['PatientID']
-        uid = meta['SeriesInstanceUID']
-        modality = meta['Modality']
-        mfm = ' '.join([meta['Manufacturer'], meta['ManufacturerModelName']])
-
-        patients.add(patient_id)
-
-        if mfm not in cfg['manufacturer_model'][modality]:
-            continue
-
-        if patient_id not in tree:
-            tree[patient_id] = {}
-
-        if modality not in tree[patient_id]:
-            tree[patient_id][modality] = set()
-
-        if uid not in tree[patient_id][modality]:
-            tree[patient_id][modality].add(uid)
-
-    single = {_: 0 for _ in pair_modalities}
-    pair = 0
-    for patient_id in tree:
-        is_single = False
-        for modality in pair_modalities:
-            if modality in tree[patient_id] and len(tree[patient_id].keys()) == 1:
-                single[modality] += 1
-                is_single = True
-        if not is_single:
-            pair += 1
-
-    summary.append('\n'.join([
-        '```mermaid', f'pie title {len(tree)} Patients on modality',
-        *[f'    "{_} only: {single[_]}": {single[_]}' for _ in pair_modalities],
-        f'    "Pair: {pair}": {pair}',
-        '```',
-    ]))
-
     # 统计摘要
-    f = Path(__file__).resolve().parent / 'SUMMARY.md'
+    f = Path(__file__).parent / (Path(__file__).name.removesuffix('.py') + '.md')
     f.write_text('\n\n'.join(summary), encoding='utf-8')
 
 

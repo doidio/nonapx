@@ -313,7 +313,7 @@ def launch():
     summary.append(f'{len(pair_meta)} valid pairs on CT-PANORAMA')
 
     summary.append('\n'.join([
-        '```mermaid', f'pie title Series on modalities',
+        '```mermaid', f'pie title Series on modality',
         *(f'    "{k}: {v}" : {v}' for k, v in num.items()),
         '```',
     ]))

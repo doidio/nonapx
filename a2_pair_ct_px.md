@@ -8,7 +8,7 @@ pie title Patients on category
 453 valid pairs on CT-PANORAMA
 
 ```mermaid
-pie title Series on modalities
+pie title Series on modality
     "CT: 1133" : 1133
     "SC: 321" : 321
     "PX: 174" : 174

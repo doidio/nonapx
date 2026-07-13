@@ -8,8 +8,28 @@ import tempfile
 
 import tomlkit
 from tqdm import tqdm
+import numpy as np
+from PIL import Image
 
 from a1_raw_dicom import meta_tags
+
+
+def dicom_float(v):
+    if v is None:
+        return None
+
+    if not isinstance(v, (str, bytes)):
+        try:
+            if len(v) == 0:
+                return None
+            v = v[0]
+        except TypeError:
+            pass
+
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
@@ -32,32 +52,40 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
         if len(files) > 1:
             return {**it, 'error': {'category': category, 'files': len(files)}}
         else:
-            image = itk.imread(files[0].as_posix(), itk.SS)
+            # read
+            image = itk.imread(files[0].as_posix())
+            origin = [float(_) for _ in itk.origin(image)]
+            spacing = [float(_) for _ in itk.spacing(image)]
+            size = [int(_) for _ in itk.size(image)]
+            minmax = [float(_) for _ in itk.range(image)]
 
-            if len(itk.size(image)) == 2:
-                import numpy as np
-                array = itk.array_from_image(image)
-                array_3d = np.expand_dims(array, axis=0)
-                image_3d = itk.image_from_array(array_3d)
+            if not (len(size) == 2 or (len(size) == 3 and size[2] == 1)):
+                return {**it, 'error': {'category': category, 'dimension': len(size), 'size': size}}
 
-                spacing = itk.spacing(image)
-                image_3d.SetSpacing([spacing[0], spacing[1], 1.0])
+            # snapshot
+            a = itk.array_from_image(image)
 
-                origin = itk.origin(image)
-                image_3d.SetOrigin([origin[0], origin[1], 0.0])
+            if a.dtype != np.uint8:
+                w = dicom_float(it.get('meta', {}).get('WindowWidth')), dicom_float(it.get('meta', {}).get('WindowCenter'))
 
-                image = image_3d
+                if w[0] is None or w[1] is None or w[0] <= 0:
+                    window = minmax
+                else:
+                    window = w[1] - w[0] * 0.5, w[1] + w[0] * 0.5
 
-            if len(itk.size(image)) == 3:
-                itk.imwrite(image, series_dir / 'image.nii.gz')
-
-                origin = [float(_) for _ in itk.origin(image)]
-                spacing = [float(_) for _ in itk.spacing(image)]
-                size = [int(_) for _ in itk.size(image)]
-                return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size}}
+                a = np.clip((a - window[0]) * 255 / (window[1] - window[0]) + 0.5, 0, 255).astype(np.uint8)
             else:
-                return {**it, 'error': {'category': category, 'dimension': len(itk.size(image))}}
+                window = minmax
+
+            # save
+            if len(a.shape) == 2:
+                a = a[np.newaxis, ...]
+            for k in range(len(a)):
+                Image.fromarray(np.ascontiguousarray(a[k].transpose(1, 0)), mode='L').save(series_dir / f'preview_{k}.png')
+            itk.imwrite(image, series_dir / 'image.nii.gz')
+            return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size, 'range': minmax, 'window': window}}
     elif category == 'CT':
+        # sort
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
 
@@ -82,28 +110,56 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
             reader.SetFileNames(file_names)
             reader.Update()
 
+        # read
         image = reader.GetOutput()
         origin = [float(_) for _ in itk.origin(image)]
         spacing = [float(_) for _ in itk.spacing(image)]
         size = [int(_) for _ in itk.size(image)]
+        minmax = [float(_) for _ in itk.range(image)]
 
         if True in [_ > 1.5 for _ in spacing]:
             return {**it, 'error': {'category': category, 'spacing': spacing}}
 
+        # snapshot
+        array = np.ascontiguousarray(itk.array_from_image(image).transpose(2, 1, 0))
+
+        w = dicom_float(it.get('meta', {}).get('WindowWidth')), dicom_float(it.get('meta', {}).get('WindowCenter'))
+
+        if w[0] is None or w[1] is None or w[0] <= 0:
+            window = (0, 900)
+        else:
+            window = w[1] - w[0] * 0.5, w[1] + w[0] * 0.5
+
+        previews = []
+        for ax in range(3):
+            a = array.copy()
+            c = window[0] < a
+            a *= c
+            a = a.sum(axis=ax)
+            c = np.sum(c, axis=ax)
+            c[np.where(c <= 0)] = 1
+            a = a / c
+
+            a = (a - window[0]) * 255 / (window[1] - window[0]) + 0.5
+            a = np.clip(a, 0, 255).astype(np.uint8)
+
+            previews.append(a)
+
         # 非均匀采样，检查是否有文件缺失
-        meta_dict = image.GetMetaDataDictionary()
-        if meta_dict.HasKey('ITK_non_uniform_sampling_deviation'):
-            d = float(meta_dict['ITK_non_uniform_sampling_deviation'])
+        itk_meta = image.GetMetaDataDictionary()
+
+        if itk_meta.HasKey('ITK_non_uniform_sampling_deviation'):
+            d = float(itk_meta['ITK_non_uniform_sampling_deviation'])
             z = float(itk.spacing(image)[2])
 
-            if z > 1e-6 and d / z < 0.1:
-                itk.imwrite(image, series_dir / 'image.nii.gz')
-                return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size}}
-            else:
+            if z == 0 or d / z > 0.1:
                 return {**it, 'error': {'category': category, 'non_uniform_sampling_deviation': d, 'slice_thickness': z}}
-        else:
-            itk.imwrite(image, series_dir / 'image.nii.gz')
-            return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size}}
+
+        # save
+        for ax, a in enumerate(previews):
+            Image.fromarray(a, mode='L').save(series_dir / f'preview_{ax}.png')
+        itk.imwrite(image, series_dir / 'image.nii.gz')
+        return {**it, 'meta': {'origin': origin, 'spacing': spacing, 'size': size, 'range': minmax, 'window': window}}
     else:
         return {**it, 'error': {'category': category}}
 
@@ -213,6 +269,7 @@ def launch():
                     'patient_id': patient_id,
                     'category': category,
                     'series_uid': series_uid,
+                    'meta': pair_meta[patient_id][category][series_uid],
                     'files': series_files[series_uid],
                 }
 
@@ -237,7 +294,7 @@ def launch():
 
                     except Exception as e:
                         it = futures[fu]
-                        it = {**it, 'error': {'category': category, 'exception': str(e)}}
+                        it = {**it, 'error': {'category': it['category'], 'exception': str(e)}}
 
                         patient_id = it['patient_id']
                         category = it['category']

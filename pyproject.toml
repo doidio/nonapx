@@ -5,12 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cucim>=23.10.0",
+    "cupy-cuda13x>=14.1.1",
     "itk>=5.4.6",
+    "opencv-python-headless>=5.0.0.93",
     "pydicom>=3.0.2",
     "streamlit>=1.59.0",
     "tomlkit>=0.15.0",
     "totalsegmentator>=2.15.0",
     "tqdm>=4.68.3",
+    "warp-lang>=1.15.0",
 ]
 
 [tool.ruff]

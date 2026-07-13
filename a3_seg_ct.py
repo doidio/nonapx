@@ -1,3 +1,6 @@
+# uv run python -O a3_seg_ct.py
+# tmux new -d -s a3 'uv run python -O a3_seg_ct.py 2>&1 | tee a3.log'
+
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import pickle
@@ -15,7 +18,8 @@ def totalseg(task: str, input_file: str | Path, output_file: str | Path):
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     from totalsegmentator.python_api import totalsegmentator
-    totalsegmentator(input_file.as_posix(), output_file.as_posix(), ml=True, task=task, quiet=False, nr_thr_resamp=16, nr_thr_saving=16)
+    totalsegmentator(input_file.as_posix(), output_file.as_posix(), ml=True, task=task, quiet=True,
+                     nr_thr_resamp=1, nr_thr_saving=1, force_split=(task == 'teeth'), device='gpu')
 
 
 def launch():
@@ -72,6 +76,9 @@ def launch():
                 totalseg(*items[0][1])
     elif args.max_workers < 2:
         for task in totalseg_tasks:
+            if len(totalseg_tasks[task]) == 0:
+                continue
+
             for series_uid, _ in tqdm(totalseg_tasks[task].items(), f'TotalSegmentator {task}', len(totalseg_tasks[task])):
                 try:
                     totalseg(*_)

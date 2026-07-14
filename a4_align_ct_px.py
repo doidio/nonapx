@@ -20,12 +20,15 @@ def resize_for_spacing(img, row_spacing, col_spacing):
 
 
 st.set_page_config('Nonapx', initial_sidebar_state='collapsed', layout='wide')
-st.markdown('### CT/PANORAMA 对齐')
+st.markdown('### CT/PANORAMA 筛选 配对 对齐')
 
 if (it := st.session_state.get('init')) is None:
     with st.spinner('初始化', show_time=True):  # noqa
         parser = argparse.ArgumentParser()
         parser.add_argument('--config', default='config.toml', type=str)
+        parser.add_argument('--start', default=0, type=int)
+        parser.add_argument('--num', default=100, type=int)
+        parser.add_argument('--user', default='Who', type=str)
         args = parser.parse_args()
 
         cfg = tomlkit.loads(Path(args.config).read_text('utf-8')).unwrap()
@@ -40,107 +43,210 @@ if (it := st.session_state.get('init')) is None:
             st.stop()
 
         pair_meta: dict = pickle.loads(save_pair_meta.read_bytes())
+        total = len(pair_meta)
+
+        keys = list(sorted(pair_meta.keys()))[args.start:args.start + args.num]
+        pair_meta = {_: pair_meta[_] for _ in keys}
 
         if len(pair_meta) == 0:
             st.error(f'配对数据为空 {save_pair_meta.as_posix()}')
             st.stop()
 
-    st.session_state['init'] = cfg, pair_meta
+    st.session_state['init'] = cfg, pair_meta, (args.start, args.num, total, args.user)
     st.rerun()
 
-elif (it := st.session_state.get('select')) is None:
-    cfg, pair_meta = st.session_state['init']
+elif (it := st.session_state.get('selected')) is None:
+    cfg, pair_meta, (start, num, total, user) = st.session_state['init']
 
     dataset_root = Path(cfg['dataset']['root']).resolve().absolute()
     dataset_pair = dataset_root / 'pair'
 
-    st.metric('Valid pairs', len(pair_meta))
+    st.metric(f'分工 {start + 1} - {start + len(pair_meta)}', f'{user}', f'子进度 {0} / {len(pair_meta)}',
+              delta_arrow='off', delta_description=f'总进度 {0} / {total}')
 
-    def fn_patient(_):
-        return f'{_} CT {len(pair_meta[_]['CT'])} PANORAMA {len(pair_meta[_]['PANORAMA'])}'
+    cols = st.columns((5, 2))
 
-    patient_id = st.selectbox('Patient ID', list(sorted(pair_meta.keys())), format_func=fn_patient)
+    with cols[0]:
+        st.subheader('筛选')
 
-    if patient_id is None:
-        st.stop()
+    with cols[0]:
+        def fn_patient(_):
+            return ' '.join([str(_), 'CT', str(len(pair_meta[_]['CT'])), 'PANORAMA', str(len(pair_meta[_]['PANORAMA']))])
 
-    def fn_series(category, _):
-        meta = pair_meta[patient_id][category][_]
+        patient_id = st.selectbox('**选择 Patient ID**', list(sorted(pair_meta.keys())), format_func=fn_patient, width=500)
+
+        if patient_id is None:
+            st.stop()
+
+        def fn_series(category, _):
+            meta = pair_meta[patient_id][category][_]
+            for _ in meta:
+                if meta[_] is None:
+                    meta[_] = ''
+
+            mfm = ' '.join([_ for _ in (meta['Manufacturer'], meta['ManufacturerModelName']) if _ != ''])
+            text = [str(meta['Modality']), mfm]
+
+            if category == 'CT':
+                text.append(str(meta['StudyDescription']))
+                text.append(str(meta['SeriesDescription']))
+                text.append(str(tuple(meta['size'])))
+                text.append(str(tuple(meta['spacing'])))
+                text.append(str(tuple(meta['range'])))
+                text.append(str(tuple(meta['window'])))
+            elif category == 'PANORAMA':
+                text.append(str(meta['StudyDescription']))
+                text.append(str(meta['SeriesDescription']))
+                text.append(str(tuple(meta['size'][:2])))
+                text.append(str(tuple(meta['spacing'][:2])))
+                text.append(str(tuple(meta['range'])))
+                text.append(str(tuple(meta['window'])))
+            return ' '.join([_ for _ in text if len(_)])
+
+        ct_series_uid = st.radio('**选择 CT Series**', list(sorted(pair_meta[patient_id]['CT'])), format_func=partial(fn_series, 'CT'))
+
+        if ct_series_uid is None:
+            st.stop()
+
+        with st.expander(ct_series_uid, False):
+            st.code(tomlkit.dumps(pair_meta[patient_id]['CT'][ct_series_uid], True), 'toml')
+
+        # if st.button('导出 CT'):
+        #     with st.spinner('正在打包'):
+        #         f = dataset_pair / patient_id / 'CT' / ct_series_id / f'image.nii.gz'
+        #         st.download_button('下载', data=f.read_bytes(), file_name=f'{patient_id}_CT_{ct_series_id}.nii.gz')
+
+        meta = pair_meta[patient_id]['CT'][ct_series_uid]
         for _ in meta:
             if meta[_] is None:
                 meta[_] = ''
 
-        mfm = ' '.join([_ for _ in (meta['Manufacturer'], meta['ManufacturerModelName']) if _ != ''])
-        text = [str(meta['Modality']), mfm]
+        previews = []
+        for i in range(10):
+            f = dataset_pair / patient_id / 'CT' / ct_series_uid / f'preview_{i}.png'
+            if not f.exists():
+                break
+            previews.append(np.flipud(np.array(Image.open(f.as_posix())).transpose(1, 0)))
 
-        if category == 'CT':
-            text.append(str(meta['StudyDescription']))
-            text.append(str(meta['SeriesDescription']))
-            text.append(str(meta['size']))
-            text.append(str(meta['spacing']))
-            text.append(str(meta['range']))
-            text.append(str(meta['window']))
-        elif category == 'PANORAMA':
-            text.append(str(meta['StudyDescription']))
-            text.append(str(meta['SeriesDescription']))
-            text.append(str(meta['size'][:2]))
-            text.append(str(meta['spacing'][:2]))
-            text.append(str(meta['range']))
-            text.append(str(meta['window']))
-        return ' '.join(text)
+        for ax, col in enumerate(st.columns(3, vertical_alignment='bottom')):
+            ax = 2 - ax
+            bc = [_ for _ in range(3) if _ != ax]
+            col.image(resize_for_spacing(previews[ax], meta['spacing'][bc[1]], meta['spacing'][bc[0]]), ['侧位', '正位', '轴位'][ax])
 
-    ct_series_id = st.radio('CT Series UID', list(sorted(pair_meta[patient_id]['CT'])), format_func=partial(fn_series, 'CT'))
+        pano_series_uid = st.radio('**选择 PANORAMA Series**',
+                                   list(sorted(pair_meta[patient_id]['PANORAMA'])), format_func=partial(fn_series, 'PANORAMA'))
 
-    if ct_series_id is None:
+        if pano_series_uid is None:
+            st.stop()
+
+        with st.expander(pano_series_uid, False):
+            st.code(tomlkit.dumps(pair_meta[patient_id]['PANORAMA'][pano_series_uid], True), 'toml')
+
+        # if st.button('导出 PANORAMA'):
+        #     with st.spinner('正在打包'):
+        #         f = dataset_pair / patient_id / 'PANORAMA' / pa_series_id / f'image.nii.gz'
+        #         st.download_button('下载', data=f.read_bytes(), file_name=f'{patient_id}_PANORAMA_{pa_series_id}.nii.gz')
+
+        meta = pair_meta[patient_id]['PANORAMA'][pano_series_uid]
+        for _ in meta:
+            if meta[_] is None:
+                meta[_] = ''
+
+        previews = []
+        for i in range(10):
+            f = dataset_pair / patient_id / 'PANORAMA' / pano_series_uid / f'preview_{i}.png'
+            if not f.exists():
+                break
+            previews.append(np.array(Image.open(f.as_posix())).transpose(1, 0))
+
+        for i in range(len(previews)):
+            st.image(previews[i], f'第 {i + 1} 帧')
+
+    with cols[1]:
+        st.subheader('配对')
+
+    subcols = cols[1].columns(2)
+
+    if 'select' not in st.session_state or patient_id not in st.session_state['select']:
+        st.session_state['select'] = {patient_id: {'CT': set(), 'PANORAMA': None}}
+
+    with subcols[1]:
+        if st.button('清空', key='clear_ct'):
+            st.session_state['select'][patient_id]['CT'] = set()
+
+    with subcols[0]:
+        if st.button('CT 多选', width='stretch'):
+            if ct_series_uid not in st.session_state['select'][patient_id]['CT']:
+                st.session_state['select'][patient_id]['CT'].add(ct_series_uid)
+
+    with cols[1]:
+        warns = set()
+        roi = {_: [set() for _ in range(3)] for _ in ('size', 'spacing', 'origin')}
+        for ct_series_uid in sorted(st.session_state['select'][patient_id]['CT']):
+            st.text(ct_series_uid)
+
+            meta = pair_meta[patient_id]['CT'][ct_series_uid]
+            for _ in ('size', 'spacing', 'origin'):
+                warn = set()
+                for i in range(3):
+                    roi[_][i].add(meta[_][i])
+
+                    if len(roi[_][i]) > 1:
+                        warn.add('XYZ'[i])
+
+                if len(warn):
+                    warns.add(_ + ' ' + ''.join(sorted(warn)))
+
+        if len(warns):
+            warns = ' '.join(sorted(warns))
+            st.warning(f'{warns} 不一致，检查 CT 同源性')
+
+    subcols = cols[1].columns(2)
+
+    with subcols[1]:
+        if st.button('清空', key='clear_panorama'):
+            st.session_state['select'][patient_id]['PANORAMA'] = None
+
+    with subcols[0]:
+        if st.button('PANORAMA 单选', width='stretch'):
+            st.session_state['select'][patient_id]['PANORAMA'] = pano_series_uid
+
+    with cols[1]:
+        if (pano_series_uid := st.session_state['select'][patient_id]['PANORAMA']):
+            st.text(pano_series_uid)
+
+    subcols = cols[1].columns(2)
+
+    with subcols[0]:
+        ct = st.session_state['select'][patient_id]['CT']
+        panorama = st.session_state['select'][patient_id]['PANORAMA']
+        if len(ct) and panorama and st.button('下一步', width='stretch'):
+            st.session_state['selected'] = st.session_state['select']
+            st.rerun()
+
+else:
+    cfg, pair_meta, (start, num, total, user) = st.session_state['init']
+
+    dataset_root = Path(cfg['dataset']['root']).resolve().absolute()
+    dataset_pair = dataset_root / 'pair'
+
+    st.metric(f'分工 {start + 1} - {start + len(pair_meta)}', f'{user}', f'子进度 {0} / {len(pair_meta)}',
+              delta_arrow='off', delta_description=f'总进度 {0} / {total}')
+
+    if (_ := len(st.session_state['select'])) != 1:
+        st.error(f'非单一患者 {_}')
         st.stop()
 
-    if st.button('导出 CT'):
-        with st.spinner('正在打包'):
-            f = dataset_pair / patient_id / 'CT' / ct_series_id / f'image.nii.gz'
-            st.download_button('下载', data=f.read_bytes(), file_name=f'{patient_id}_CT_{ct_series_id}.nii.gz')
+    patient_id = list(st.session_state['select'].keys())[0]
 
-    meta = pair_meta[patient_id]['CT'][ct_series_id]
-    for _ in meta:
-        if meta[_] is None:
-            meta[_] = ''
+    st.caption(f'患者 {patient_id}')
 
-    previews = []
-    for i in range(10):
-        f = dataset_pair / patient_id / 'CT' / ct_series_id / f'preview_{i}.png'
-        if not f.exists():
-            break
-        previews.append(np.flipud(np.array(Image.open(f.as_posix())).transpose(1, 0)))
+    ct_series_uids = st.session_state['select'][patient_id]['CT']
+    pano_series_uid = st.session_state['select'][patient_id]['PANORAMA']
 
-    for ax, col in enumerate(st.columns(3, vertical_alignment='bottom')):
-        ax = 2 - ax
-        bc = [_ for _ in range(3) if _ != ax]
-        col.image(resize_for_spacing(previews[ax], meta['spacing'][bc[1]], meta['spacing'][bc[0]]), ['侧位', '正位', '轴位'][ax])
+    for ct_series_uid in ct_series_uids:
+        with st.expander(ct_series_uid, False):
+            st.code(tomlkit.dumps(pair_meta[patient_id]['CT'][ct_series_uid], True), 'toml')
 
-    st.code(tomlkit.dumps(meta, True), 'toml')
-
-    pa_series_id = st.radio('PANORAMA Series UID', list(sorted(pair_meta[patient_id]['PANORAMA'])), format_func=partial(fn_series, 'PANORAMA'))
-
-    if pa_series_id is None:
-        st.stop()
-
-    if st.button('导出 PANORAMA'):
-        with st.spinner('正在打包'):
-            f = dataset_pair / patient_id / 'PANORAMA' / pa_series_id / f'image.nii.gz'
-            st.download_button('下载', data=f.read_bytes(), file_name=f'{patient_id}_PANORAMA_{pa_series_id}.nii.gz')
-
-    meta = pair_meta[patient_id]['PANORAMA'][pa_series_id]
-    for _ in meta:
-        if meta[_] is None:
-            meta[_] = ''
-
-    previews = []
-    for i in range(10):
-        f = dataset_pair / patient_id / 'PANORAMA' / pa_series_id / f'preview_{i}.png'
-        if not f.exists():
-            break
-        previews.append(np.array(Image.open(f.as_posix())).transpose(1, 0))
-
-    for i in range(len(previews)):
-        st.image(previews[i], f'第 {i + 1} 帧')
-
-    st.code(tomlkit.dumps(meta, True), 'toml')
+    with st.expander(pano_series_uid, False):
+        st.code(tomlkit.dumps(pair_meta[patient_id]['PANORAMA'][pano_series_uid], True), 'toml')

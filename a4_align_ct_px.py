@@ -1,4 +1,4 @@
-# tmux new -d -s a4 'uv run streamlit run a4_align_ct_px.py --server.port 8501 2>&1 | tee a4.log'
+# tmux new -d -s a4 'xvfb-run -a uv run streamlit run a4_align_ct_px.py --server.port 8501 --server.headless true 2>&1 | tee a4.log'
 
 import argparse
 import pickle
@@ -11,12 +11,42 @@ import tomlkit
 import cv2
 import tomlkit
 from PIL import Image
+import itk
+import pyvista as pv
+
+from a4_kernel import extract_surface_wp
 
 
 def resize_for_spacing(img, row_spacing, col_spacing):
     h, w = img.shape[:2]
     new_h = max(1, round(h * row_spacing / col_spacing))
     return cv2.resize(img, (w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def fn_series(category, _):
+    meta = pair_meta[patient_id][category][_]
+    for _ in meta:
+        if meta[_] is None:
+            meta[_] = ''
+
+    mfm = ' '.join([_ for _ in (meta['Manufacturer'], meta['ManufacturerModelName']) if _ != ''])
+    text = [str(meta['Modality']), mfm]
+
+    if category == 'CT':
+        text.append(str(meta['StudyDescription']))
+        text.append(str(meta['SeriesDescription']))
+        text.append(str(tuple(meta['size'])))
+        text.append(str(tuple(meta['spacing'])))
+        text.append(str(tuple(meta['range'])))
+        text.append(str(tuple(meta['window'])))
+    elif category == 'PANORAMA':
+        text.append(str(meta['StudyDescription']))
+        text.append(str(meta['SeriesDescription']))
+        text.append(str(tuple(meta['size'][:2])))
+        text.append(str(tuple(meta['spacing'][:2])))
+        text.append(str(tuple(meta['range'])))
+        text.append(str(tuple(meta['window'])))
+    return ' '.join([_ for _ in text if len(_)])
 
 
 st.set_page_config('Nonapx', initial_sidebar_state='collapsed', layout='wide')
@@ -78,31 +108,6 @@ elif (it := st.session_state.get('selected')) is None:
         if patient_id is None:
             st.stop()
 
-        def fn_series(category, _):
-            meta = pair_meta[patient_id][category][_]
-            for _ in meta:
-                if meta[_] is None:
-                    meta[_] = ''
-
-            mfm = ' '.join([_ for _ in (meta['Manufacturer'], meta['ManufacturerModelName']) if _ != ''])
-            text = [str(meta['Modality']), mfm]
-
-            if category == 'CT':
-                text.append(str(meta['StudyDescription']))
-                text.append(str(meta['SeriesDescription']))
-                text.append(str(tuple(meta['size'])))
-                text.append(str(tuple(meta['spacing'])))
-                text.append(str(tuple(meta['range'])))
-                text.append(str(tuple(meta['window'])))
-            elif category == 'PANORAMA':
-                text.append(str(meta['StudyDescription']))
-                text.append(str(meta['SeriesDescription']))
-                text.append(str(tuple(meta['size'][:2])))
-                text.append(str(tuple(meta['spacing'][:2])))
-                text.append(str(tuple(meta['range'])))
-                text.append(str(tuple(meta['window'])))
-            return ' '.join([_ for _ in text if len(_)])
-
         ct_series_uid = st.radio('**选择 CT Series**', list(sorted(pair_meta[patient_id]['CT'])), format_func=partial(fn_series, 'CT'))
 
         if ct_series_uid is None:
@@ -113,8 +118,8 @@ elif (it := st.session_state.get('selected')) is None:
 
         # if st.button('导出 CT'):
         #     with st.spinner('正在打包'):
-        #         f = dataset_pair / patient_id / 'CT' / ct_series_id / f'image.nii.gz'
-        #         st.download_button('下载', data=f.read_bytes(), file_name=f'{patient_id}_CT_{ct_series_id}.nii.gz')
+        #         f = dataset_pair / patient_id / 'CT' / ct_series_uid / f'image.nii.gz'
+        #         st.download_button('下载', data=f.read_bytes(), file_name=f'{patient_id}_CT_{ct_series_uid}.nii.gz')
 
         meta = pair_meta[patient_id]['CT'][ct_series_uid]
         for _ in meta:
@@ -126,7 +131,10 @@ elif (it := st.session_state.get('selected')) is None:
             f = dataset_pair / patient_id / 'CT' / ct_series_uid / f'preview_{i}.png'
             if not f.exists():
                 break
-            previews.append(np.flipud(np.array(Image.open(f.as_posix())).transpose(1, 0)))
+            _ = np.array(Image.open(f.as_posix())).transpose(1, 0)
+            if i in (0, 1):
+                _ = np.flipud(_)
+            previews.append(_)
 
         for ax, col in enumerate(st.columns(3, vertical_alignment='bottom')):
             ax = 2 - ax
@@ -160,7 +168,7 @@ elif (it := st.session_state.get('selected')) is None:
             previews.append(np.array(Image.open(f.as_posix())).transpose(1, 0))
 
         for i in range(len(previews)):
-            st.image(previews[i], f'第 {i + 1} 帧')
+            st.image(resize_for_spacing(previews[i], meta['spacing'][1], meta['spacing'][0]), f'第 {i + 1} 帧')
 
     with cols[1]:
         st.subheader('配对')
@@ -234,7 +242,7 @@ else:
               delta_arrow='off', delta_description=f'总进度 {0} / {total}')
 
     if (_ := len(st.session_state['select'])) != 1:
-        st.error(f'非单一患者 {_}')
+        st.error(f'非同一患者 {_}')
         st.stop()
 
     patient_id = list(st.session_state['select'].keys())[0]
@@ -245,8 +253,137 @@ else:
     pano_series_uid = st.session_state['select'][patient_id]['PANORAMA']
 
     for ct_series_uid in ct_series_uids:
-        with st.expander(ct_series_uid, False):
+        with st.expander(fn_series('CT', ct_series_uid), False):
             st.code(tomlkit.dumps(pair_meta[patient_id]['CT'][ct_series_uid], True), 'toml')
 
-    with st.expander(pano_series_uid, False):
+    with st.expander(fn_series('PANORAMA', pano_series_uid), False):
         st.code(tomlkit.dumps(pair_meta[patient_id]['PANORAMA'][pano_series_uid], True), 'toml')
+
+    # 载入 CT 和全景片
+    if 'images' not in st.session_state:
+        with st.spinner('载入图像'):
+            images = {}
+
+            for series_uid in [pano_series_uid, *ct_series_uids]:
+                category = 'PANORAMA' if series_uid == pano_series_uid else 'CT'
+
+                f = dataset_pair / patient_id / category / series_uid / 'image.nii.gz'
+                image = itk.imread(f.as_posix())
+                origin = [float(_) for _ in itk.origin(image)]
+                spacing = [float(_) for _ in itk.spacing(image)]
+                size = [int(_) for _ in itk.size(image)]
+                minmax = [int(_) for _ in itk.range(image)]
+
+                a = itk.array_from_image(image)
+
+                if series_uid == pano_series_uid:
+                    if len(a.shape) == 3 and a.shape[0] == 1:
+                        a = a[0]
+                        origin = origin[1:]
+                        spacing = spacing[1:]
+                        size = size[1:]
+
+                    if len(a.shape) != 2:
+                        st.error(f'不支持的 {category} shape={a.shape}')
+                        st.stop()
+
+                a = np.ascontiguousarray(a.transpose(*[_ for _ in reversed(range(len(a.shape)))]))
+                images[series_uid] = (a, origin, spacing, size, minmax)
+
+            st.session_state['images'] = images
+
+    images = st.session_state['images']
+
+    cols = st.columns((2, 1))
+    views = [_.container() for _ in cols]
+
+    # 全景片
+    if 'panorama' not in st.session_state:
+        a, origin, spacing, size, minmax = images[pano_series_uid]
+        meta = pair_meta[patient_id]['PANORAMA'][pano_series_uid]
+
+        if a.dtype != np.uint8:
+            w = meta['window']
+            a = np.clip((a - w[0]) * 255 / (w[1] - w[0]) + 0.5, 0, 255).astype(np.uint8)
+
+        a = resize_for_spacing(a.transpose(1, 0), spacing[1], spacing[0])
+        st.session_state['panorama'] = a
+
+    panorama = st.session_state['panorama']
+    with cols[0]:
+        views[0].image(panorama, 'PANORAMA')
+
+    cols_3d = cols[1].columns((panorama.shape[1], panorama.shape[0]))
+
+    with cols_3d[0]:
+        view_type: str = st.radio('视角', ['右侧位', '右斜位', '正位', '左斜位', '左侧位', '轴位'], 2, horizontal=True)
+
+    with cols_3d[1]:
+        minmax = min([images[_][-1][0] for _ in ct_series_uids]), max([images[_][-1][1] for _ in ct_series_uids])
+        bone_min = st.number_input(f'骨阈值 [{minmax[0]}, {minmax[1]}]', *minmax, 250, 10)
+
+    # 面网格重建
+    if 'bone_3d' not in st.session_state or st.session_state['bone_3d'][0] != bone_min:
+        bone_meshes = {}
+        with st.spinner('三维重建'):
+            for series_uid in ct_series_uids:
+                a, origin, spacing, size, _ = images[series_uid]
+                mesh = extract_surface_wp(a, origin, spacing, bone_min)
+                bone_meshes[series_uid] = mesh
+
+        st.session_state['bone_3d'] = bone_min, bone_meshes
+
+    bone_min, bone_meshes = st.session_state['bone_3d']
+
+    # 模拟射线源
+
+    # 3D 可视化
+    pl = pv.Plotter(off_screen=True, border=False, window_size=[panorama.shape[0], panorama.shape[0]],
+                    line_smoothing=True, point_smoothing=True, polygon_smoothing=True)
+    pl.enable_parallel_projection()
+    pl.enable_depth_peeling()
+    pl.enable_anti_aliasing('msaa')
+
+    bounds = None
+    colors = list(pv.hex_colors.keys())[:len(bone_meshes)]
+    for i, series_uid in enumerate(bone_meshes):
+        mesh = bone_meshes[series_uid]
+        pl.add_mesh(mesh, color=colors[i], render=False)
+
+        if bounds is None:
+            bounds = np.array(mesh.bounds)
+        else:
+            bounds = np.array([np.min([bounds[0], mesh.bounds[0]], axis=0), np.max([bounds[1], mesh.bounds[1]], axis=0)])
+
+    assert bounds is not None
+
+    if view_type == '右侧位':
+        pl.camera_position = 'xz'
+        pl.camera.Azimuth(-90)
+    elif view_type == '右斜位':
+        pl.camera_position = 'xz'
+        pl.camera.Azimuth(-45)
+    elif view_type == '正位':
+        pl.camera_position = 'xz'
+    elif view_type == '左斜位':
+        pl.camera_position = 'xz'
+        pl.camera.Azimuth(45)
+    elif view_type == '左侧位':
+        pl.camera_position = 'xz'
+        pl.camera.Azimuth(90)
+    elif view_type == '轴位':
+        pl.camera_position = 'xy'
+        pl.camera.Elevation(180)
+
+    b = bounds - np.array([0, 0.5*(bounds[1][1] - bounds[0][1]), 0])
+    pl.reset_camera(bounds=b.T.flatten())
+    pl.camera.Zoom(1.5)
+    # pl.camera.parallel_scale = (bounds[1][2] - bounds[0][2]) * 0.5
+    # pl.reset_camera_clipping_range()
+    # pl.render()
+
+    with cols[1]:
+        views[1].image(np.array(pl.screenshot(return_img=True)), 'CT')
+
+    pl.close()
+    del pl

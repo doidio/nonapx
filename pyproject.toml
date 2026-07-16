@@ -10,10 +10,14 @@ dependencies = [
     "itk>=5.4.6",
     "opencv-python-headless>=5.0.0.93",
     "pydicom>=3.0.2",
+    "pyright>=1.1.411",
+    "pyvista>=0.48.4",
+    "ruff>=0.15.21",
     "streamlit>=1.59.0",
     "tomlkit>=0.15.0",
     "totalsegmentator>=2.15.0",
     "tqdm>=4.68.3",
+    "trimesh>=4.12.2",
     "warp-lang>=1.15.0",
 ]
 

@@ -10,6 +10,8 @@ import warnings
 import tomlkit
 from tqdm import tqdm
 
+totalseg_task_names = {'total', 'teeth', 'craniofacial_structures', 'head_glands_cavities', 'head_muscles', 'headneck_bones_vessels'}
+
 
 def totalseg(task: str, input_file: str | Path, output_file: str | Path):
     input_file = Path(input_file)
@@ -47,14 +49,7 @@ def launch():
         errors = {}
 
     # 统计增量任务
-    totalseg_tasks = {
-        'total': {},
-        'teeth': {},
-        'craniofacial_structures': {},
-        'head_glands_cavities': {},
-        'head_muscles': {},
-        'headneck_bones_vessels': {},
-    }
+    totalseg_tasks = {_: {} for _ in totalseg_task_names}
     for patient_id in pair_meta:
         for category in ('CT', ):
             for series_uid in pair_meta[patient_id][category]:

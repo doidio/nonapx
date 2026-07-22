@@ -1,3 +1,5 @@
+# tmux new -d -s a2 'uv run python a2_pair_ct_px.py 2>&1 | tee a2.log'
+
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import pickle
@@ -58,6 +60,26 @@ def series_read(dataset_raw: Path, dataset_pair: Path, it: dict):
             spacing = [float(_) for _ in itk.spacing(image)]
             size = [int(_) for _ in itk.size(image)]
             minmax = [float(_) for _ in itk.range(image)]
+
+            meta = dict(image)
+            modality = meta.get('0008|0060', '')
+            pixel_spacing = meta.get('0028|0030', '')
+
+            if modality == 'PX' and pixel_spacing:
+                detector_spacing = None
+                try:
+                    if isinstance(pixel_spacing, str):
+                        detector_spacing = [float(_) for _ in pixel_spacing.strip().split('\\') if _]
+                    elif isinstance(pixel_spacing, (list, tuple)):
+                        detector_spacing = [float(_) for _ in pixel_spacing]
+                except:
+                    pass
+
+                if detector_spacing is None or len(detector_spacing) != 2:
+                    return {**it, 'error': {'category': category, 'modality': modality, 'pixel_spacing': pixel_spacing}}
+
+                spacing[:len(detector_spacing)] = detector_spacing[::-1]
+                image.SetSpacing(spacing)
 
             if not (len(size) == 2 or (len(size) == 3 and size[2] == 1)):
                 return {**it, 'error': {'category': category, 'dimension': len(size), 'size': size}}

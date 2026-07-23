@@ -364,7 +364,7 @@ else:
     pano_img = panorama.copy()
 
     _ = st.columns((panorama.shape[1], panorama.shape[0]), vertical_alignment='bottom')
-    view_3d_head = _[1].columns((3, 1))
+    view_3d_head = _[1].columns((4, 1), vertical_alignment='bottom')
     views = [_.container() for _ in _]
 
     _ = st.columns((panorama.shape[1], panorama.shape[0]))
@@ -373,18 +373,23 @@ else:
 
     detector_spacing = st.session_state['detector_spacing']
     detector_magfact = st.session_state['detector_magfact']
-    st.write(detector_spacing)
 
     # 面网格重建
     with view_3d_head[1]:
         minmax = min([images[_][-1][0] for _ in ct_series_uids]), max([images[_][-1][1] for _ in ct_series_uids])
-        bone_min = st.number_input(f'骨阈值 [{minmax[0]}, {minmax[1]}]', *minmax, 250, 10, key='bone_min')
+        bone_min = st.number_input(f'骨阈值 [{minmax[0]}, {minmax[1]}]', *minmax, 250, 10, key='bone_min_input')
 
-    if len([_ for _ in ('bone_3d', 'bone_bounds', 'bone_center', 'bone_hl') if _ not in st.session_state]) or st.session_state['bone_3d'][0] != bone_min:
+    keys = ('bone_meshes', 'bone_min', 'bone_bounds', 'bone_center', 'bone_hl')
+    if len([_ for _ in keys if _ not in st.session_state]) or st.session_state['bone_min'] != bone_min:
         bone_meshes, bone_bounds = {}, None
         with st.spinner('三维重建'):
             for series_uid in ct_series_uids:
                 a, origin, spacing, size, _ = images[series_uid]
+
+                # new_spacing = np.full_like(spacing, np.max(spacing))
+                # new_a = resample_volume_wp(a, spacing, new_spacing)
+                # mesh = extract_surface_wp(new_a, origin, new_spacing, bone_min)
+
                 mesh = extract_surface_wp(a, origin, spacing, bone_min)
                 bone_meshes[series_uid] = mesh
 
@@ -400,15 +405,16 @@ else:
         bone_bounds[0] = bone_center - bone_hl
         bone_bounds[1] = bone_center + bone_hl
 
-        st.session_state['bone_3d'] = bone_min, bone_meshes
+        st.session_state['bone_meshes'] = bone_meshes
+        st.session_state['bone_min'] = bone_min
         st.session_state['bone_bounds'] = bone_bounds
         st.session_state['bone_center'] = bone_center
         st.session_state['bone_hl'] = bone_hl
 
-    bone_min, bone_meshes = st.session_state['bone_3d']
-    bone_bounds = st.session_state['bone_bounds']
-    bone_center = st.session_state['bone_center']
+    bone_meshes = st.session_state['bone_meshes']
     bone_hl = st.session_state['bone_hl']
+    bone_center = st.session_state['bone_center']
+    bone_bounds = st.session_state['bone_bounds']
 
     # 扫描坐标系，原点在弓形弧顶，左右对称
     with view_3d_foot[4]:
@@ -483,17 +489,21 @@ else:
 
     scan_size = st.session_state['scan_size']
 
-    with view_2d_foot[0]:
-        for i in range(3):
+    for i in range(3):
+        with view_2d_foot[i]:
             _ = ['左右半宽', '前后纵深', '上下半高'][i]
             scan_size[i] = st.number_input(f'{_} 0 ~ {scan_size_default[i] * 2:.1f} mm', 0.1,
                                            scan_size_default[i] * 2, scan_size[i], 0.1, '%.1f', key=f'scan_size_{i}')
     st.session_state['scan_size'] = scan_size
 
     # 弓形中点切线长度
-    with view_2d_foot[1]:
+    with view_2d_foot[3]:
         arch_level = st.number_input('弓形系数 0.1 ~ 1.9', 0.1, 1.9, 1.0, 0.1, '%.1f', key='arch_level')
         mid_tg = arch_level * scan_size[0]
+
+    # 焦层深度
+    with view_2d_foot[4]:
+        focal_trough_depth = st.number_input('焦层深度 1 ~ 20 mm', 1, 20, 10, 1, key='focal_trough_depth')
 
     # 三次参数曲线
     def scan_spline(u):
@@ -555,21 +565,27 @@ else:
     with views[0]:
         st.image(pano_img, f'全景 {panorama.shape[1]} x {panorama.shape[0]}')
 
-    # 3D 可视化
-    pl = pv.Plotter(off_screen=True, border=False, window_size=[panorama.shape[0], panorama.shape[0]],
-                    line_smoothing=True, point_smoothing=True, polygon_smoothing=True)
-    pl.enable_parallel_projection()
-    # pl.enable_depth_peeling()  # xvfb 不支持半透明物体深度排序
-    pl.enable_anti_aliasing('msaa')
-
     view_settings = {
         '↖': (30, -30), '↑': (0, -90), '↗': (-30, -30),
         '←': (90, 0), '+': (0, 0), '→': (-90, 0),
-        '↙': (30, 30), '↓': (0, 90), '↘': (-30, 30),
+        '↙': (150, -30), '↓': (0, 90), '↘': (-150, -30),
     }
 
     with view_3d_head[0]:
         view_type: str = st.radio('视图', [*view_settings.keys(), '#'], horizontal=True)
+
+    if view_type in view_settings:
+        view_angles = [view_settings[view_type]]
+    else:
+        view_angles = list(view_settings.values())
+
+    # 3D 可视化
+    h = round(panorama.shape[0] // np.sqrt(len(view_angles)))
+    w = round(h * scan_size[0] / scan_size[2])
+    pl = pv.Plotter(off_screen=True, border=False, window_size=[w, h], line_smoothing=True, polygon_smoothing=True)
+    pl.enable_parallel_projection()
+    # pl.enable_depth_peeling()  # xvfb 不支持半透明物体深度排序
+    pl.enable_anti_aliasing('msaa')
 
     # 绘制颅骨
     actor_bounds = None
@@ -578,6 +594,7 @@ else:
         actor = pl.add_mesh(bone_meshes[series_uid], color=colors[i], render=False)
         actor.user_matrix = to_scan
         bounds = np.array(actor.bounds).reshape(3, 2).T
+        # actor.SetVisibility(False)
 
         if actor_bounds is None:
             actor_bounds = bounds
@@ -591,41 +608,37 @@ else:
     # 绘制焦层中心曲线
     axis_y, axis_z = [], []
     for i in range(0, len(scan_curve), max(1, len(scan_curve) // 100)):
-        axis_y.append(scan_curve[i] - scan_axis_y[i] * 5)
-        axis_y.append(scan_curve[i] + scan_axis_y[i] * 5)
+        axis_y.append(scan_curve[i] - scan_axis_y[i] * focal_trough_depth * 0.5)
+        axis_y.append(scan_curve[i] + scan_axis_y[i] * focal_trough_depth * 0.5)
         axis_z.append(scan_curve[i] - scan_axis_z[i] * scan_size[2])
         axis_z.append(scan_curve[i] + scan_axis_z[i] * scan_size[2])
 
-    pl.add_lines(np.asarray(axis_y), connected=False, color=[0.25, 1.0, 0.25], width=2)
-    pl.add_lines(np.asarray(axis_z), connected=False, color=[0.0, 0.5, 1.0], width=2)
+    line_width = pl.window_size[1] // 400
+    curve_z = pl.add_lines(np.asarray(axis_z), connected=False, color=[0.0, 0.5, 1.0], width=line_width)
+    curve_y = pl.add_lines(np.asarray(axis_y), connected=False, color=[0.25, 1.0, 0.25], width=line_width * 2)
+    curve_x = pl.add_lines(np.asarray(scan_curve), connected=True, color=[1.0, 0.0, 0.0], width=line_width * 2)
 
     # 视角
-    if view_type in view_settings:
-        view_angles = [view_settings[view_type]]
-    else:
-        view_angles = list(view_settings.values())
-
-    parallel_scale = np.linalg.norm(bone_bounds[1] - bone_bounds[0]) * 0.4
-
-    focal_point = np.mean(actor_bounds, axis=0)
-    camera_distance = np.linalg.norm(actor_bounds[1] - actor_bounds[0]) * 2.0
-    z_axis = np.array([0.0, 0.0, 1.0])
+    h = np.linalg.norm(scan_size[2]) * 1.2
+    b = (np.array([-bone_hl, bone_hl]) + np.array([0, scan_size[1] * 0.5, 0])).T.flatten()
 
     imgs = []
     for azimuth, elevation in view_angles:
+        curve_x.SetVisibility(elevation != 0)
+
         pl.camera_position = 'xz'
-        pl.reset_camera(bounds=np.array([-bone_hl, bone_hl]).T.flatten())
+        pl.reset_camera(bounds=b)
         pl.camera.Azimuth(azimuth)
         pl.camera.Elevation(elevation)
         pl.camera.OrthogonalizeViewUp()
-        pl.camera.parallel_scale = parallel_scale
+        pl.camera.parallel_scale = h
         pl.reset_camera_clipping_range()
         pl.render()
 
         imgs.append(np.array(pl.screenshot(return_img=True)))
 
-    if len(imgs) == 9:
-        img = np.vstack([np.hstack(imgs[i:i + 3]) for i in range(0, 9, 3)])
+    if len(imgs) % 3 == 0:
+        img = np.vstack([np.hstack(imgs[i:i + 3]) for i in range(0, len(imgs), 3)])
     else:
         img = imgs[0]
 

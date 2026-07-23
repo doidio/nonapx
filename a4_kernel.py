@@ -2,6 +2,7 @@ import warp as wp
 import numpy as np
 import trimesh
 import itk
+import pyvista as pv
 from vtk import vtkImageData, vtkFlyingEdges3D, VTK_FLOAT
 from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
@@ -19,6 +20,81 @@ def _get_volume_np(volume) -> np.ndarray:
         return vtk_to_numpy(volume.GetPointData().GetScalars()).reshape(shape, order='F')
     else:
         raise TypeError(f"Unsupported volume type: {type(volume)}")
+
+
+@wp.kernel
+def _resample_volume_kernel(
+    tex: wp.Texture3D,
+    old_spacing: wp.vec3,
+    new_spacing: wp.vec3,
+    old_dim: wp.vec3,
+    out: wp.array3d(dtype=wp.float32),
+):
+    i, j, k = wp.tid()
+
+    w = (float(i) * new_spacing[0] / old_spacing[0] + 0.5) / old_dim[0]
+    v = (float(j) * new_spacing[1] / old_spacing[1] + 0.5) / old_dim[1]
+    u = (float(k) * new_spacing[2] / old_spacing[2] + 0.5) / old_dim[2]
+
+    out[i, j, k] = wp.texture_sample(tex, wp.vec3f(u, v, w), dtype=float)
+
+
+def resample_volume_wp(
+    volume: wp.array3d[wp.float32] | np.ndarray | itk.Image | vtkImageData,
+    spacing: float | np.ndarray | list,
+    new_spacing: float | np.ndarray | list,
+    filter_mode: wp.TextureFilterMode = wp.TextureFilterMode.LINEAR,
+    address_mode: wp.TextureAddressMode = wp.TextureAddressMode.BORDER,
+) -> np.ndarray:
+    vol_np = _get_volume_np(volume).astype(np.float32, copy=False)
+
+    if isinstance(spacing, (float, int)):
+        old_spacing_arr = np.array([spacing, spacing, spacing], dtype=np.float32)
+    else:
+        old_spacing_arr = np.array(spacing, dtype=np.float32)
+
+    if isinstance(new_spacing, (float, int)):
+        new_spacing_arr = np.array([new_spacing, new_spacing, new_spacing], dtype=np.float32)
+    else:
+        new_spacing_arr = np.array(new_spacing, dtype=np.float32)
+
+    old_shape = vol_np.shape
+    new_shape = tuple(max(1, int(round(old_shape[i] * old_spacing_arr[i] / new_spacing_arr[i]))) for i in range(3))
+
+    tex = wp.Texture3D(
+        np.ascontiguousarray(vol_np),
+        filter_mode=filter_mode,
+        address_mode=address_mode,
+    )
+
+    old_spacing_wp = wp.vec3(float(old_spacing_arr[0]), float(old_spacing_arr[1]), float(old_spacing_arr[2]))
+    new_spacing_wp = wp.vec3(float(new_spacing_arr[0]), float(new_spacing_arr[1]), float(new_spacing_arr[2]))
+    old_dim_wp = wp.vec3(float(old_shape[0]), float(old_shape[1]), float(old_shape[2]))
+
+    out_wp = wp.zeros(new_shape, dtype=wp.float32)
+    wp.launch(_resample_volume_kernel, dim=new_shape, inputs=[tex, old_spacing_wp, new_spacing_wp, old_dim_wp, out_wp])
+
+    return out_wp.numpy()
+
+
+def decimate_mesh_vtk(
+    mesh: trimesh.Trimesh,
+    target_reduction: float = 0.8,
+    method: str = "quadric",
+) -> trimesh.Trimesh:
+    if len(mesh.vertices) == 0 or target_reduction <= 0:
+        return mesh
+
+    faces_pv = np.hstack([np.full((len(mesh.faces), 1), 3, dtype=np.int64), mesh.faces]).ravel()
+    pv_mesh = pv.PolyData(mesh.vertices, faces_pv)
+
+    if method == "pro":
+        decimated = pv_mesh.decimate_pro(target_reduction, preserve_topology=True)
+    else:
+        decimated = pv_mesh.decimate(target_reduction)
+
+    faces_out = decimated.faces.reshape(-1, 4)[:, 1:]
+    return trimesh.Trimesh(vertices=np.asarray(decimated.points), faces=np.asarray(faces_out))
 
 
 def extract_surface_wp(
@@ -160,3 +236,11 @@ if __name__ == '__main__':
     np.testing.assert_array_equal(mesh_warp.faces, mesh_vtk2.faces)
 
     print("\n✅ Multi-Type Consistency test passed! All 4 types (wp, np, itk, vtk) yield strictly identical results.")
+
+    print("\n--- Running resample_volume_wp Test ---")
+    resampled = resample_volume_wp(volume_contig, spacing, 2.5)
+    print(f"Original shape: {volume_contig.shape}, Resampled shape: {resampled.shape}")
+    mesh_resampled = extract_surface_wp(resampled, origin, 2.5, threshold)
+    print(f"Resampled mesh vertices: {len(mesh_resampled.vertices)}, faces: {len(mesh_resampled.faces)}")
+    print("✅ resample_volume_wp test passed successfully!")
+

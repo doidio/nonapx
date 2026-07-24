@@ -19,7 +19,11 @@ import itk
 import pyvista as pv
 
 from a3_seg_ct import totalseg_task_names
-from a4_kernel import extract_surface_wp
+from a4_kernel import extract_surface_wp, ct_to_panorama
+
+
+CRANIOFACIAL_STRUCTURES = {'mandible': 1, 'teeth_lower': 2, 'skull': 3, 'teeth_upper': 7}
+CRANIOFACIAL_STRUCTURES_fn = {'mandible': '下颌', 'teeth_lower': '下牙', 'skull': '上颌', 'teeth_upper': '上牙'}
 
 
 def resize_for_spacing(img, row_spacing, col_spacing):
@@ -182,8 +186,8 @@ elif (it := st.session_state.get('selected')) is None:
             bc = [_ for _ in range(3) if _ != ax]
             col.image(resize_for_spacing(previews[ax], meta['spacing'][bc[1]], meta['spacing'][bc[0]]), ['侧位', '正位', '轴位'][ax])
 
-        pano_series_uid = st.radio('**选择 PANORAMA Series**',
-                                   list(sorted(pair_meta[patient_id]['PANORAMA'])), format_func=partial(fn_series, 'PANORAMA'))
+        _ = list(sorted(pair_meta[patient_id]['PANORAMA']))
+        pano_series_uid = st.radio('**选择 PANORAMA Series**', _, format_func=partial(fn_series, 'PANORAMA'))
 
         if pano_series_uid is None:
             st.stop()
@@ -216,22 +220,22 @@ elif (it := st.session_state.get('selected')) is None:
 
     subcols = cols[1].columns(2)
 
-    if 'select' not in st.session_state or patient_id not in st.session_state['select']:
-        st.session_state['select'] = {patient_id: {'CT': set(), 'PANORAMA': None}}
+    if '_select' not in st.session_state or patient_id not in st.session_state['_select']:
+        st.session_state['_select'] = {patient_id: {'CT': set(), 'PANORAMA': None}}
 
     with subcols[1]:
-        if st.button('清空', key='clear_ct'):
-            st.session_state['select'][patient_id]['CT'] = set()
+        if st.button('清空', key='_clear_ct'):
+            st.session_state['_select'][patient_id]['CT'] = set()
 
     with subcols[0]:
         if st.button('CT 多选', width='stretch'):
-            if ct_series_uid not in st.session_state['select'][patient_id]['CT']:
-                st.session_state['select'][patient_id]['CT'].add(ct_series_uid)
+            if ct_series_uid not in st.session_state['_select'][patient_id]['CT']:
+                st.session_state['_select'][patient_id]['CT'].add(ct_series_uid)
 
     with cols[1]:
         warns = set()
         roi = {_: [set() for _ in range(3)] for _ in ('size', 'spacing', 'origin')}
-        for ct_series_uid in sorted(st.session_state['select'][patient_id]['CT']):
+        for ct_series_uid in sorted(st.session_state['_select'][patient_id]['CT']):
             st.text(ct_series_uid)
 
             meta = pair_meta[patient_id]['CT'][ct_series_uid]
@@ -253,24 +257,24 @@ elif (it := st.session_state.get('selected')) is None:
     subcols = cols[1].columns(2)
 
     with subcols[1]:
-        if st.button('清空', key='clear_panorama'):
-            st.session_state['select'][patient_id]['PANORAMA'] = None
+        if st.button('清空', key='_clear_panorama'):
+            st.session_state['_select'][patient_id]['PANORAMA'] = None
 
     with subcols[0]:
         if st.button('PANORAMA 单选', width='stretch'):
-            st.session_state['select'][patient_id]['PANORAMA'] = pano_series_uid
+            st.session_state['_select'][patient_id]['PANORAMA'] = pano_series_uid
 
     with cols[1]:
-        if (pano_series_uid := st.session_state['select'][patient_id]['PANORAMA']):
+        if (pano_series_uid := st.session_state['_select'][patient_id]['PANORAMA']):
             st.text(pano_series_uid)
 
     subcols = cols[1].columns(2)
 
     with subcols[0]:
-        ct = st.session_state['select'][patient_id]['CT']
-        panorama = st.session_state['select'][patient_id]['PANORAMA']
+        ct = st.session_state['_select'][patient_id]['CT']
+        panorama = st.session_state['_select'][patient_id]['PANORAMA']
         if len(ct) and panorama and st.button('下一步', width='stretch'):
-            st.session_state['selected'] = st.session_state['select']
+            st.session_state['selected'] = st.session_state['_select']
             st.rerun()
 
 else:
@@ -282,16 +286,16 @@ else:
     st.metric(f'分工 {start + 1} - {start + len(pair_meta)}', f'{user}', f'子进度 {0} / {len(pair_meta)}',
               delta_arrow='off', delta_description=f'总进度 {0} / {total}')
 
-    if (_ := len(st.session_state['select'])) != 1:
+    if (_ := len(st.session_state['selected'])) != 1:
         st.error(f'非同一患者 {_}')
         st.stop()
 
-    patient_id = list(st.session_state['select'].keys())[0]
+    patient_id = list(st.session_state['selected'].keys())[0]
 
     st.caption(f'患者 {patient_id}')
 
-    ct_series_uids = st.session_state['select'][patient_id]['CT']
-    pano_series_uid = st.session_state['select'][patient_id]['PANORAMA']
+    ct_series_uids = st.session_state['selected'][patient_id]['CT']
+    pano_series_uid = st.session_state['selected'][patient_id]['PANORAMA']
 
     for ct_series_uid in ct_series_uids:
         with st.expander(fn_series('CT', ct_series_uid), False):
@@ -304,6 +308,7 @@ else:
     if 'images' not in st.session_state:
         with st.spinner('载入图像'):
             images = {}
+            craniofacial_structures = {}
 
             for series_uid in [pano_series_uid, *ct_series_uids]:
                 category = 'PANORAMA' if series_uid == pano_series_uid else 'CT'
@@ -331,9 +336,20 @@ else:
                 a = np.ascontiguousarray(a.transpose(*[_ for _ in reversed(range(len(a.shape)))]))
                 images[series_uid] = (a, origin, spacing, size, minmax)
 
+                if series_uid != pano_series_uid:
+                    f = dataset_root / 'totalsegmentator' / series_uid / 'craniofacial_structures.nii.gz'
+                    if not f.exists():
+                        st.error(f'{series_uid} 的 {f.name} 不存在')
+                        st.stop()
+
+                    a = itk.array_from_image(itk.imread(f.as_posix()))
+                    craniofacial_structures[series_uid] = np.ascontiguousarray(a.transpose(*[_ for _ in reversed(range(len(a.shape)))]))
+
             st.session_state['images'] = images
+            st.session_state['craniofacial_structures'] = craniofacial_structures
 
     images = st.session_state['images']
+    craniofacial_structures = st.session_state['craniofacial_structures']
 
     # 全景片
     if len([_ for _ in ('panorama', 'detector_spacing', 'detector_magfact') if _ not in st.session_state]):
@@ -347,9 +363,7 @@ else:
         a = resize_for_spacing(a.transpose(1, 0), spacing[1], spacing[0])
         st.session_state['panorama'] = a
 
-        # 探测器像素间距
-        st.session_state['detector_spacing'] = 0.1
-
+        # 探测器像素间距和放大率
         if meta['Modality'] == 'PX':  # Planmeca ProMax 0.08 mm Sirona ORTHOPHOS XG 0.108003 mm
             st.session_state['detector_spacing'] = (spacing[0] + spacing[1]) * 0.5
             st.session_state['detector_magfact'] = 1.1
@@ -364,39 +378,57 @@ else:
     pano_img = panorama.copy()
 
     _ = st.columns((panorama.shape[1], panorama.shape[0]), vertical_alignment='bottom')
-    view_3d_head = _[1].columns((4, 1), vertical_alignment='bottom')
+    view_3d_head = [_[1].columns(spec) for spec in ((4, 1), (4, 1))]
     views = [_.container() for _ in _]
 
     _ = st.columns((panorama.shape[1], panorama.shape[0]))
     view_2d_foot = _[0].columns(5)
+    view_2d_last = _[0].columns(2)
     view_3d_foot = _[1].columns(5)
 
-    detector_spacing = st.session_state['detector_spacing']
-    detector_magfact = st.session_state['detector_magfact']
+    detector_spacing = st.session_state.get('detector_spacing', 0.1)
+    detector_magfact = st.session_state.get('detector_magfact', 1.1)
+
+    # 选择 CT 序列
+    with view_3d_head[0][0]:
+        ct_series_uid = st.selectbox('CT', ct_series_uids, format_func=partial(fn_series, 'CT'),
+                                     label_visibility='collapsed', key='_ct_series_uid')
+
+    # 骨选择
+    bone_classes = {'skull': '上颌', 'teeth_upper': '上颌', 'mandible': '下颌', 'teeth_lower': '下颌'}
+    bone_checked = {k: view_3d_head[i][1].checkbox(k, i) for i, k in enumerate(('上颌', '下颌'))}
+    bone_checked = [_ for _ in bone_classes if bone_checked[bone_classes[_]]]
+    st.session_state['bone_checked'] = bone_checked
 
     # 面网格重建
-    with view_3d_head[1]:
-        minmax = min([images[_][-1][0] for _ in ct_series_uids]), max([images[_][-1][1] for _ in ct_series_uids])
-        bone_min = st.number_input(f'骨阈值 [{minmax[0]}, {minmax[1]}]', *minmax, 250, 10, key='bone_min_input')
-
-    keys = ('bone_meshes', 'bone_min', 'bone_bounds', 'bone_center', 'bone_hl')
-    if len([_ for _ in keys if _ not in st.session_state]) or st.session_state['bone_min'] != bone_min:
+    if len([_ for _ in ('ct', 'bone') if _ not in st.session_state]) or st.session_state['ct'][0] != ct_series_uid:
         bone_meshes, bone_bounds = {}, None
         with st.spinner('三维重建'):
-            for series_uid in ct_series_uids:
-                a, origin, spacing, size, _ = images[series_uid]
+            ct_array, ct_origin, ct_spacing, ct_size, minmax = images[ct_series_uid]
+            ct_texture = wp.Texture3D(
+                np.ascontiguousarray(ct_array, dtype=np.float32),
+                filter_mode=wp.TextureFilterMode.LINEAR,
+                address_mode=wp.TextureAddressMode.CLAMP,
+            )
+            ct_masks = {name: craniofacial_structures[ct_series_uid] == CRANIOFACIAL_STRUCTURES[name] for name in bone_classes}
 
-                # new_spacing = np.full_like(spacing, np.max(spacing))
-                # new_a = resample_volume_wp(a, spacing, new_spacing)
-                # mesh = extract_surface_wp(new_a, origin, new_spacing, bone_min)
+            ct_bone = {}
+            for name, mask in ct_masks.items():
+                vals = ct_array[mask]
+                mean = float(vals.mean()) if vals.size > 0 else 250.0
+                std = float(vals.std()) if vals.size > 0 else 0.0
+                ct_bone[name] = mean - std if vals.size > 0 else 250.0
 
-                mesh = extract_surface_wp(a, origin, spacing, bone_min)
-                bone_meshes[series_uid] = mesh
+                a = ct_array.copy()
+                a[~mask & (a > ct_bone[name])] = minmax[0]
+                mesh = extract_surface_wp(a, ct_origin, ct_spacing, ct_bone[name])
+                bone_meshes[name] = mesh
 
-                if bone_bounds is None:
-                    bone_bounds = np.array(mesh.bounds)
-                else:
-                    bone_bounds = np.array([np.min([bone_bounds[0], mesh.bounds[0]], axis=0), np.max([bone_bounds[1], mesh.bounds[1]], axis=0)])
+                if bone_classes[name] == '下颌':
+                    if bone_bounds is None:
+                        bone_bounds = np.array(mesh.bounds)
+                    else:
+                        bone_bounds = np.array([np.min([bone_bounds[0], mesh.bounds[0]], axis=0), np.max([bone_bounds[1], mesh.bounds[1]], axis=0)])
 
         assert bone_bounds is not None
 
@@ -405,16 +437,11 @@ else:
         bone_bounds[0] = bone_center - bone_hl
         bone_bounds[1] = bone_center + bone_hl
 
-        st.session_state['bone_meshes'] = bone_meshes
-        st.session_state['bone_min'] = bone_min
-        st.session_state['bone_bounds'] = bone_bounds
-        st.session_state['bone_center'] = bone_center
-        st.session_state['bone_hl'] = bone_hl
+        st.session_state['ct'] = ct_series_uid, ct_masks, ct_texture, ct_origin, ct_spacing, ct_size, ct_bone
+        st.session_state['bone'] = bone_meshes, bone_bounds, bone_center, bone_hl
 
-    bone_meshes = st.session_state['bone_meshes']
-    bone_hl = st.session_state['bone_hl']
-    bone_center = st.session_state['bone_center']
-    bone_bounds = st.session_state['bone_bounds']
+    ct_series_uid, ct_masks, ct_texture, ct_origin, ct_spacing, ct_size, ct_bone = st.session_state['ct']
+    bone_meshes, bone_bounds, bone_center, bone_hl = st.session_state['bone']
 
     # 扫描坐标系，原点在弓形弧顶，左右对称
     with view_3d_foot[4]:
@@ -479,31 +506,22 @@ else:
     from_scan_wp = wp.transform(wp.vec3(scan_cs_pos), scan_cs_rot)
     to_scan_wp = wp.transform_inverse(from_scan_wp)
 
-    # 牙齿、骨皮质等在透视方向上较薄的结构特征，远源点小角度和近源点大角度可能生成结构相似的局部图像
-    # 焦层中心曲面 focal-trough center surface，等距平行于射线源轨迹 X-ray source trajectory
-    h = panorama.shape[0] * detector_spacing / detector_magfact / bone_hl[2] / 2
-    scan_size_default = tuple(np.ceil(float(_ * h) / 0.1) * 0.1 for _ in bone_hl)
+    # 扫描范围初始估计
+    default = panorama.shape[0] * detector_spacing / detector_magfact / 2 / bone_hl[2]
+    default = [int(np.ceil(default * _)) for _ in (bone_hl[0], bone_hl[1] * 2, bone_hl[2])]
 
-    if len([_ for _ in ('scan_size', ) if _ not in st.session_state]):
-        st.session_state['scan_size'] = list(scan_size_default)
-
-    scan_size = st.session_state['scan_size']
-
-    for i in range(3):
-        with view_2d_foot[i]:
-            _ = ['左右半宽', '前后纵深', '上下半高'][i]
-            scan_size[i] = st.number_input(f'{_} 0 ~ {scan_size_default[i] * 2:.1f} mm', 0.1,
-                                           scan_size_default[i] * 2, scan_size[i], 0.1, '%.1f', key=f'scan_size_{i}')
+    scan_size = [view_2d_foot[i].number_input(f'{name} 0 ~ {default[i] * 2} mm', 1, default[i] * 2, default[i], 1, key=f'_scan_size_{i}')
+                 for i, name in enumerate(['左右半宽', '前后纵深', '上下半高'])]
     st.session_state['scan_size'] = scan_size
 
     # 弓形中点切线长度
     with view_2d_foot[3]:
-        arch_level = st.number_input('弓形系数 0.1 ~ 1.9', 0.1, 1.9, 1.0, 0.1, '%.1f', key='arch_level')
+        arch_level = st.number_input('弓形系数 0.1 ~ 9.9', 0.1, 9.9, 1.0, 0.1, '%.1f', key='_arch_level')
         mid_tg = arch_level * scan_size[0]
 
     # 焦层深度
     with view_2d_foot[4]:
-        focal_trough_depth = st.number_input('焦层深度 1 ~ 20 mm', 1, 20, 10, 1, key='focal_trough_depth')
+        focal_trough_depth = st.number_input('焦层深度 10 ~ 500 mm', 10, 500, 50, 10, key='_focal_trough_depth')
 
     # 三次参数曲线
     def scan_spline(u):
@@ -520,7 +538,7 @@ else:
         return np.column_stack((x, y, np.zeros_like(u)))
 
     # 近似弧长均匀
-    u_dense = np.linspace(-1.0, 1.0, panorama.shape[1] * 4)
+    u_dense = np.linspace(-1.0, 1.0, max(1024, panorama.shape[1]))
     curve_dense = scan_spline(u_dense)
 
     seg_len = np.linalg.norm(np.diff(curve_dense, axis=0), axis=1)
@@ -531,6 +549,21 @@ else:
     u = np.interp(np.linspace(0.0, 1.0, panorama.shape[1]), arc_len, u_dense)
     scan_curve = scan_spline(u)
 
+    # 横向像素间距及其误差
+    seg_len = np.linalg.norm(np.diff(scan_curve, axis=0), axis=1)
+    spacing_horizontal = float(seg_len.mean())
+
+    st.session_state['spacing_horizontal_std'] = float(seg_len.std())
+    st.session_state['spacing_horizontal_max_error'] = float(np.max(np.abs(seg_len - spacing_horizontal)) / spacing_horizontal)
+
+    spacing_vertical = float(scan_size[2] * 2 / panorama.shape[0])
+    st.session_state['sim_spacing'] = (spacing_horizontal, spacing_vertical)
+
+    sim_spacing = np.array(st.session_state['sim_spacing'])
+
+    with view_2d_foot[0]:
+        st.caption(f'焦层中心像素间距 {sim_spacing}')
+
     # 焦层中心坐标系
     scan_axis_u = scan_spline_derivative(u)
     scan_axis_u /= np.linalg.norm(scan_axis_u, axis=1, keepdims=True)
@@ -539,31 +572,40 @@ else:
     scan_axis_y = np.cross(scan_axis_z, scan_axis_u)
     scan_axis_y /= np.linalg.norm(scan_axis_y, axis=1, keepdims=True)
 
-    if len([_ for _ in ('scan_plane_height', ) if _ not in st.session_state]):
-        st.session_state['scan_plane_height'] = panorama.shape[0] * detector_spacing / detector_magfact
+    # 平行光源近似模拟，虽然远源点小角度和近源点大角度可能生成结构相似的局部图像，但对于牙齿、骨皮质等在透视方向上较薄的结构特征，射线累积差异不大
+    sim_panorama = wp.empty(panorama.shape, dtype=wp.float32)
+    scan_curve_wp = wp.array(scan_curve, dtype=wp.vec3)
+    scan_axis_y_wp = wp.array(scan_axis_y, dtype=wp.vec3)
+    scan_axis_z_wp = wp.array(scan_axis_z, dtype=wp.vec3)
+    wp.launch(ct_to_panorama, sim_panorama.shape, [
+        sim_panorama, ct_texture,
+        wp.vec3(ct_origin), wp.vec3(ct_spacing), wp.vec3(ct_size),
+        from_scan_wp, float(sim_spacing[1]), float(focal_trough_depth), float(np.min(ct_spacing)),
+        scan_curve_wp, scan_axis_y_wp, scan_axis_z_wp,
+    ])
+    sim_panorama_np = sim_panorama.numpy()
 
-    scan_plane_height = st.session_state['scan_plane_height']
-
-    # 相机内参
-    with view_2d_foot[2]:
-        # 估计射线源到探测器距离 Source-Detector Distance
-        sdd = (bone_bounds[1][1] - bone_bounds[0][1]) * 2.0
-
-        # 估计相机焦距 focal length
-        # unit = round(sdd / detector_spacing / 10)
-        # focal_length = st.number_input(f'焦距 [{unit}, {unit * 20}] px', unit, unit * 20, unit * 10)
-
-        # 主点
-        # principal_point = np.array([slit_hw, (panorama.shape[0] - 1) / 2])
-        # intrisics = np.array([
-        #     [focal_length, 0, principal_point[0]],
-        #     [0, focal_length, principal_point[1]],
-        #     [0, 0, 1],
-        # ])
+    p_low, p_high = np.percentile(sim_panorama_np, (0.5, 99.5))
+    if p_high > p_low:
+        sim_panorama_img = np.clip((sim_panorama_np - p_low) * 255.0 / (p_high - p_low), 0, 255).astype(np.uint8)
+    else:
+        sim_panorama_img = np.zeros(sim_panorama_np.shape, dtype=np.uint8)
 
     # 2D 可视化
     with views[0]:
-        st.image(pano_img, f'全景 {panorama.shape[1]} x {panorama.shape[0]}')
+        tabs = st.tabs(['真实', '模拟', '叠加'])
+
+        with tabs[0]:
+            st.image(pano_img, f'全景 {panorama.shape[1]} x {panorama.shape[0]}')
+
+        with tabs[1]:
+            st.image(sim_panorama_img, f'模拟 {sim_panorama_img.shape[1]} x {sim_panorama_img.shape[0]}')
+
+        with tabs[2]:
+            overlay_img = np.zeros((*pano_img.shape, 3), dtype=np.uint8)
+            overlay_img[..., 0] = pano_img
+            overlay_img[..., 1] = sim_panorama_img
+            st.image(overlay_img, f'叠加 {overlay_img.shape[1]} x {overlay_img.shape[0]}')
 
     view_settings = {
         '↖': (30, -30), '↑': (0, -90), '↗': (-30, -30),
@@ -571,8 +613,8 @@ else:
         '↙': (150, -30), '↓': (0, 90), '↘': (-150, -30),
     }
 
-    with view_3d_head[0]:
-        view_type: str = st.radio('视图', [*view_settings.keys(), '#'], horizontal=True)
+    with view_3d_head[1][0]:
+        view_type: str = st.radio('视图', [*view_settings.keys(), '#'], horizontal=True, label_visibility='collapsed')
 
     if view_type in view_settings:
         view_angles = [view_settings[view_type]]
@@ -589,12 +631,11 @@ else:
 
     # 绘制颅骨
     actor_bounds = None
-    colors = list(pv.hex_colors.keys())[:len(bone_meshes)]
-    for i, series_uid in enumerate(bone_meshes):
-        actor = pl.add_mesh(bone_meshes[series_uid], color=colors[i], render=False)
+    for i, name in enumerate(bone_meshes):
+        color = 'orange' if name in bone_checked else 'white'
+        actor = pl.add_mesh(bone_meshes[name], color=color, render=False)
         actor.user_matrix = to_scan
         bounds = np.array(actor.bounds).reshape(3, 2).T
-        # actor.SetVisibility(False)
 
         if actor_bounds is None:
             actor_bounds = bounds

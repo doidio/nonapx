@@ -39,12 +39,71 @@ def _resample_volume_kernel(
     out[i, j, k] = wp.texture_sample(tex, wp.vec3f(u, v, w), dtype=float)
 
 
+@wp.kernel
+def ct_to_panorama(
+    image: wp.array2d(dtype=wp.float32),
+    tex: wp.Texture3D,
+    volume_origin: wp.vec3,
+    volume_spacing: wp.vec3,
+    volume_shape: wp.vec3,
+    scan_to_world: wp.transform,
+    vertical_spacing: float,
+    focal_trough_depth: float,
+    ray_step: float,
+    origins: wp.array(dtype=wp.vec3),
+    axes_y: wp.array(dtype=wp.vec3),
+    axes_z: wp.array(dtype=wp.vec3),
+):
+    row, col = wp.tid()
+
+    origin = origins[col]
+    axis_y = axes_y[col]
+    axis_z = axes_z[col]
+
+    origin = wp.transform_point(scan_to_world, origin)
+    axis_y = wp.normalize(wp.transform_vector(scan_to_world, axis_y))
+    axis_z = wp.normalize(wp.transform_vector(scan_to_world, axis_z))
+
+    center_row = 0.5 * float(image.shape[0] - 1)
+    origin += axis_z * ((center_row - float(row)) * vertical_spacing)
+
+    sample_count = int(wp.ceil(focal_trough_depth / ray_step))
+    sample_step = focal_trough_depth / float(sample_count)
+    ray_start = -0.5 * focal_trough_depth + 0.5 * sample_step
+    projection = float(0.0)
+
+    for sample_index in range(sample_count):
+        point = origin + axis_y * (ray_start + float(sample_index) * sample_step)
+        index = wp.cw_div(point - volume_origin, volume_spacing)
+
+        inside = (
+            index[0] >= -0.5
+            and index[0] <= volume_shape[0] - 0.5
+            and index[1] >= -0.5
+            and index[1] <= volume_shape[1] - 0.5
+            and index[2] >= -0.5
+            and index[2] <= volume_shape[2] - 0.5
+        )
+        if inside:
+            # Texture3D maps the NumPy (X, Y, Z) array to texture (Z, Y, X).
+            uvw = wp.vec3(
+                (index[2] + 0.5) / volume_shape[2],
+                (index[1] + 0.5) / volume_shape[1],
+                (index[0] + 0.5) / volume_shape[0],
+            )
+            hu = wp.texture_sample(tex, uvw, dtype=float)
+            relative_attenuation = wp.max(hu + 1000.0, 0.0) / 1000.0
+            projection += relative_attenuation * sample_step
+
+    image[row, col] = projection
+
+
 def resample_volume_wp(
     volume: wp.array3d[wp.float32] | np.ndarray | itk.Image | vtkImageData,
     spacing: float | np.ndarray | list,
     new_spacing: float | np.ndarray | list,
     filter_mode: wp.TextureFilterMode = wp.TextureFilterMode.LINEAR,
-    address_mode: wp.TextureAddressMode = wp.TextureAddressMode.BORDER,
+    address_mode: wp.TextureAddressMode = wp.TextureAddressMode.CLAMP,
 ) -> np.ndarray:
     vol_np = _get_volume_np(volume).astype(np.float32, copy=False)
 
@@ -243,4 +302,3 @@ if __name__ == '__main__':
     mesh_resampled = extract_surface_wp(resampled, origin, 2.5, threshold)
     print(f"Resampled mesh vertices: {len(mesh_resampled.vertices)}, faces: {len(mesh_resampled.faces)}")
     print("✅ resample_volume_wp test passed successfully!")
-
